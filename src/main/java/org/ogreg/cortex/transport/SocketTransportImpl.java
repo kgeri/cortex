@@ -1,10 +1,6 @@
 package org.ogreg.cortex.transport;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.BindException;
 import java.net.InetSocketAddress;
@@ -13,11 +9,9 @@ import java.net.Socket;
 import java.net.SocketAddress;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -30,6 +24,7 @@ import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.message.Response;
 import org.ogreg.cortex.registry.ServiceRegistry;
+import org.ogreg.cortex.util.ProcessUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,7 +35,7 @@ import org.slf4j.LoggerFactory;
  * @author Gergely Kiss
  */
 public class SocketTransportImpl implements Transport {
-	private static final Logger log = LoggerFactory.getLogger(SocketTransportImpl.class);
+	static final Logger log = LoggerFactory.getLogger(SocketTransportImpl.class);
 
 	/** The start of the usable port range (inclusive). */
 	private int minPort = 4000;
@@ -52,7 +47,7 @@ public class SocketTransportImpl implements Transport {
 	private int socketBufferSize = 32768;
 
 	/** The port on which the server was bound, or 0 if it is not. */
-	private int port = 0;
+	int port = 0;
 
 	/** The service registry used to service requests. */
 	private ServiceRegistry registry;
@@ -135,7 +130,7 @@ public class SocketTransportImpl implements Transport {
 		if (listener != null) {
 			listener.interrupt();
 		}
-		
+
 		closeAllConnections();
 
 		listener = null;
@@ -193,8 +188,9 @@ public class SocketTransportImpl implements Transport {
 	 * @param message
 	 * @return
 	 */
-	private Message execute(Message message) {
+	Message execute(Message message) {
 
+		// TODO Use executor
 		if (message instanceof Invocation) {
 			Invocation m = (Invocation) message;
 
@@ -223,7 +219,7 @@ public class SocketTransportImpl implements Transport {
 				if (connection.isOpen() && (socket == null)) {
 					return connection;
 				} else {
-					closeConnection(connection);
+					closeConnection(addr, connection);
 				}
 			}
 
@@ -233,26 +229,26 @@ public class SocketTransportImpl implements Transport {
 				socket.setReuseAddress(true);
 				socket.setReceiveBufferSize(socketBufferSize);
 				socket.setSendBufferSize(socketBufferSize);
-				socket.connect(address, (int) check(until, "Timed out before socket connect"));
+				socket.connect(address,
+						(int) ProcessUtils.check(until, "Timed out before socket connect"));
 				log.debug("Opened connection to: {}", addr);
 			}
 
 			try {
-				connection = new Connection(addr, socket);
+				connection = new Connection(this, socket);
 				connection.start(until);
 				connections.put(addr, connection);
 
 				return connection;
 			} catch (InterruptedException e) {
-				closeConnection(connection);
+				closeConnection(addr, connection);
 				throw e;
 			}
 		}
 	}
 
-	void closeConnection(Connection connection) {
-		String addr = connection.getKey();
-		
+	// TODO only reopen instead of close
+	void closeConnection(String addr, Connection connection) {
 		synchronized (addr) {
 			Connection conn = connections.get(addr);
 
@@ -287,19 +283,6 @@ public class SocketTransportImpl implements Transport {
 
 	public void setSocketBufferSize(int socketBufferSize) {
 		this.socketBufferSize = socketBufferSize;
-	}
-
-	private static long check(long until, String message) throws InterruptedException {
-		if (Thread.interrupted()) {
-			throw new InterruptedException();
-		} else {
-			long remaining = until - System.currentTimeMillis();
-			if (remaining < 1) {
-				throw new InterruptedException(message);
-			} else {
-				return remaining;
-			}
-		}
 	}
 
 	// Server listener thread
@@ -347,198 +330,6 @@ public class SocketTransportImpl implements Transport {
 	}
 
 	/**
-	 * Represents a duplex connection against a remote host.
-	 * 
-	 * @author Gergely Kiss
-	 */
-	// Package private for testing
-	final class Connection {
-		private final String addr;
-		private final Socket socket;
-
-		private final Queue<Message> output = new LinkedBlockingQueue<Message>();
-		private final Semaphore semOutput = new Semaphore(0);
-		private final Map<Integer, MessageCallback<?>> callbacks = new ConcurrentHashMap<Integer, MessageCallback<?>>();
-
-		private final Thread reader;
-		private final Thread writer;
-
-		private boolean open = false;
-
-		public Connection(String addr, Socket socket) {
-			this.addr = addr;
-			this.socket = socket;
-
-			SocketAddress address = socket.getRemoteSocketAddress();
-
-			reader = new ChannelReader();
-			reader.setName(port + "-ChannelReader-" + address);
-			reader.setDaemon(true);
-
-			writer = new ChannelWriter();
-			writer.setName(port + "-ChannelWriter-" + address);
-			writer.setDaemon(true);
-		}
-
-		private void start(long until) throws InterruptedException {
-			synchronized (writer) {
-				writer.start();
-				writer.wait(check(until, "Timed out before Reader start"));
-			}
-			synchronized (reader) {
-				reader.start();
-				reader.wait(check(until, "Timed out before Writer start"));
-			}
-			check(until, "Connection start timed out");
-			this.open = true;
-		}
-
-		private <R> void append(Message message, MessageCallback<R> callback) throws IOException {
-			if (callback != null) {
-				callbacks.put(message.messageId, callback);
-			}
-			output.add(message);
-			semOutput.release();
-		}
-
-		private boolean isOpen() {
-			System.err.println(addr + " open=" + open);
-			return open;
-		}
-
-		private void close() {
-			open = false;
-			try {
-				socket.close();
-			} catch (IOException e) {
-				log.error("Failed to close socket: {} ({})", socket, e.getLocalizedMessage());
-				log.debug("Failure trace", e);
-			}
-			reader.interrupt();
-			writer.interrupt();
-
-			for (MessageCallback<?> callback : callbacks.values()) {
-				try {
-					callback.onFailure(new IOException("Connection closed"));
-				} catch (Exception e) {
-					log.error("Failed to callback: " + callback, e);
-				}
-			}
-
-			for (Message message : output) {
-				synchronized (message) {
-					message.notifyAll();
-				}
-			}
-
-			log.debug("Connection closed, callbacks notified: " + addr);
-		}
-
-		String getKey() {
-			return addr;
-		}
-
-		final class ChannelReader extends Thread {
-			@Override
-			@SuppressWarnings({ "unchecked", "rawtypes" })
-			public void run() {
-				try {
-					InputStream in = socket.getInputStream();
-					ObjectInputStream is = new ObjectInputStream(in);
-
-					synchronized (this) {
-						notifyAll();
-					}
-
-					while (!isInterrupted()) {
-						// Responding to incoming messages
-						Message message;
-
-						try {
-							message = (Message) is.readObject();
-						} catch (ClassCastException e) {
-							log.error("Unsupported message type", e);
-							continue;
-						}
-
-						// If it is a response, then we notify the listeners and remove it
-						if (message instanceof Response) {
-							Response response = (Response) message;
-
-							MessageCallback callback = callbacks.remove(response.requestId);
-
-							if (callback == null) {
-								continue;
-							}
-
-							if (response instanceof ErrorResponse) {
-								callback.onFailure(((ErrorResponse) response).getError());
-							} else {
-								try {
-									callback.onSuccess(response.value);
-								} catch (ClassCastException e) {
-									log.error("Unexpected response type", e);
-								} catch (Exception e) {
-									log.error("Unexpected callback failure", e);
-								}
-							}
-						}
-						// Otherwise we try to serve the request
-						else {
-							Message response = execute(message);
-							append(response, null);
-						}
-					}
-				} catch (IOException e) {
-					log.debug("ChannelReader IO error ({})", e.getLocalizedMessage());
-					log.trace("Failure trace", e);
-				} catch (Throwable e) {
-					log.error("ChannelReader FAILED", e);
-				} finally {
-					closeConnection(Connection.this);
-				}
-			}
-
-		}
-
-		final class ChannelWriter extends Thread {
-			@Override
-			public void run() {
-				try {
-					OutputStream out = socket.getOutputStream();
-					ObjectOutputStream os = new ObjectOutputStream(out);
-					os.flush();
-
-					synchronized (this) {
-						notifyAll();
-					}
-
-					while (!isInterrupted()) {
-
-						// Sending the next message from the queue
-						semOutput.acquire();
-						Message message = output.poll();
-						if (message != null) {
-							os.writeObject(message);
-							os.reset();
-							os.flush();
-						}
-					}
-				} catch (InterruptedException e) {
-					log.debug("ChannelWriter interrupted");
-				} catch (IOException e) {
-					log.debug("ChannelWriter IO error ({})", e.getLocalizedMessage());
-					log.trace("Failure trace", e);
-				} catch (Throwable e) {
-					log.error("ChannelWriter FAILED, closing connection", e);
-				} finally {
-					closeConnection(Connection.this);
-				}
-			}
-		}
-	}
-
-	/**
 	 * Message callback for handling messages synchronously.
 	 * 
 	 * @author Gergely Kiss
@@ -581,7 +372,7 @@ public class SocketTransportImpl implements Transport {
 					if (!connection.isOpen()) {
 						throw new IOException("Connection was closed while waiting for response");
 					}
-					check(until, "Response timed out");
+					ProcessUtils.check(until, "Response timed out");
 					request.wait(100);
 				}
 

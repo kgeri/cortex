@@ -1,0 +1,1 @@
+protoc src/main/proto/messages.proto --java_out=src/main/java

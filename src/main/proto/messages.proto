@@ -1,0 +1,19 @@
+package org.ogreg.cortex.transport;
+
+option java_outer_classname = "MulticastProtocol";
+
+message Messages {
+	required string cortex = 1;
+	optional Discover discover = 2;
+	optional ServiceLoc service_location = 3;
+	
+	message Discover {
+		required string clazz = 1;
+		optional string identifier = 2;
+	}
+	
+	message ServiceLoc {
+		required string clazz = 1;
+		optional string identifier = 2;
+	}
+}

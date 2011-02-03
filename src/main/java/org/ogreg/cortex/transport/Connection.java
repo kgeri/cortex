@@ -1,5 +1,6 @@
 package org.ogreg.cortex.transport;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ObjectInputStream;
@@ -7,236 +8,192 @@ import java.io.ObjectOutputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.net.SocketAddress;
-import java.util.Map;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
 
-import org.ogreg.cortex.message.ErrorResponse;
 import org.ogreg.cortex.message.Message;
-import org.ogreg.cortex.message.MessageCallback;
-import org.ogreg.cortex.message.Response;
 import org.ogreg.cortex.util.ProcessUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Represents a duplex connection against a remote host.
+ * Represents a duplex connection to a remote host.
  * 
  * @author Gergely Kiss
  */
-final class Connection {
+final class Connection implements Closeable {
 	private static final Logger log = LoggerFactory.getLogger(Connection.class);
 
-	private final SocketTransportImpl transport;
 	private final Socket socket;
-
-	private final Queue<Message> output = new LinkedBlockingQueue<Message>();
-	private final Semaphore semOutput = new Semaphore(0);
-	private final Map<Integer, MessageCallback<?>> callbacks = new ConcurrentHashMap<Integer, MessageCallback<?>>();
-
 	private final ChannelThread reader;
 	private final ChannelThread writer;
+	private final ClientChannel channel;
 
-	public Connection(SocketTransportImpl transport, Socket socket) {
-		this.transport = transport;
+	public Connection(Socket socket, ClientChannel channel) {
 		this.socket = socket;
+		this.channel = channel;
 
 		SocketAddress address = socket.getRemoteSocketAddress();
 
 		reader = new ChannelReader();
-		reader.setName(transport.getBoundPort() + "-ChannelReader-" + address);
+		reader.setName("ChannelReader-" + address);
 		reader.setDaemon(true);
 
 		writer = new ChannelWriter();
-		writer.setName(transport.getBoundPort() + "-ChannelWriter-" + address);
+		writer.setName("ChannelWriter-" + address);
 		writer.setDaemon(true);
 	}
 
-	void start(long until) throws InterruptedException {
+	@Override
+	public synchronized void close() throws IOException {
+		reader.close();
+		writer.close();
+		socket.close();
+	}
+
+	public synchronized void start(long until) throws InterruptedException {
 		synchronized (writer) {
-			writer.start();
+			if (!writer.isAlive()) {
+				writer.start();
+			}
 			writer.wait(ProcessUtils.check(until, "Timed out before Reader start"));
 		}
 		synchronized (reader) {
-			reader.start();
+			if (!reader.isAlive()) {
+				reader.start();
+			}
 			reader.wait(ProcessUtils.check(until, "Timed out before Writer start"));
 		}
 		ProcessUtils.check(until, "Connection start timed out");
 	}
 
-	<R> void append(Message message, MessageCallback<R> callback) throws IOException {
-		if (callback != null) {
-			callbacks.put(message.messageId, callback);
-		}
-		output.add(message);
-		semOutput.release();
-	}
-
 	boolean isOpen() {
-		// TODO revise this
-		return reader.isOpen() && writer.isOpen();
+		return reader.open && writer.open;
 	}
 
-	synchronized void close() {
-		reader.close();
-		writer.close();
-		ProcessUtils.closeQuietly(socket);
-
-		for (MessageCallback<?> callback : callbacks.values()) {
-			try {
-				callback.onFailure(new IOException("Connection closed"));
-			} catch (Exception e) {
-				log.error("Unexpected callback failure", e);
-			}
-		}
-
-		for (Message message : output) {
-			synchronized (message) {
-				message.notifyAll();
-			}
-		}
+	Socket getSocket() {
+		return socket;
 	}
 
 	@Override
 	public String toString() {
-		return socket.getRemoteSocketAddress() + " [reader=" + reader.state + ", writer="
-				+ writer.state + "]";
+		return socket.getRemoteSocketAddress() + " [readerOpen=" + reader.open + ", writerOpen="
+				+ writer.open + "]";
 	}
 
-	enum ConnectionState {
-		INIT, OPEN, CLOSING
-	}
+	/**
+	 * Common base class for connection R/W threads.
+	 * 
+	 * @author Gergely Kiss
+	 */
+	private abstract class ChannelThread extends Thread {
+		private boolean open = false;
 
-	abstract class ChannelThread extends Thread {
-		ConnectionState state = ConnectionState.INIT;
-
-		void close() {
-			state = ConnectionState.CLOSING;
+		private void close() {
+			open = false;
 			interrupt();
-		}
-
-		boolean isOpen() {
-			return state == ConnectionState.OPEN;
 		}
 
 		@Override
 		public void run() {
-			while (true) {
-				try {
-					establishConnection();
+			try {
+				establishConnection(socket);
 
-					synchronized (this) {
-						state = ConnectionState.OPEN;
-						notifyAll();
-					}
-
-					processMessages();
-				} catch (InterruptedException e) {
-					log.debug("{} interrupted", getName());
-				} catch (IOException e) {
-					log.debug("{} IO error ({})", getName(), e.getLocalizedMessage());
-					log.trace("Failure trace", e);
-				} catch (Throwable e) {
-					log.error(getName() + " FAILED, closing connection", e);
+				synchronized (this) {
+					open = true;
+					notifyAll();
 				}
 
-				if (state == ConnectionState.CLOSING) {
-					break;
-				} else {
-					state = ConnectionState.INIT;
-					log.debug("Reopening {} in {}ms", getName(), 100);
-					try {
-						sleep(100);
-					} catch (InterruptedException e) {
-					}
+				while (!isInterrupted() && open) {
+					processMessage();
 				}
+			} catch (InterruptedException e) {
+				log.debug("{} interrupted", getName());
+			} catch (IOException e) {
+				log.debug("{} IO error ({})", getName(), e.getLocalizedMessage());
+				log.debug("Failure trace", e);
+			} catch (Throwable e) {
+				log.error(getName() + " FAILED, closing connection", e);
+			} finally {
+				open = false;
 			}
 		}
 
-		protected abstract void establishConnection() throws IOException;
+		/**
+		 * Implementors should initialize the connection here.
+		 * 
+		 * @param socket
+		 * @throws IOException if initialization failed
+		 */
+		protected abstract void establishConnection(Socket socket) throws IOException;
 
-		protected abstract void processMessages() throws InterruptedException, IOException;
+		/**
+		 * Implementors should process one incoming/outgoing message here.
+		 * 
+		 * @throws IOException if processing failed
+		 * @throws InterruptedException if execution was interrupted
+		 */
+		protected abstract void processMessage() throws IOException, InterruptedException;
 	}
 
-	final class ChannelReader extends ChannelThread {
+	/**
+	 * Connection thread for reading remote requests.
+	 * 
+	 * @author Gergely Kiss
+	 */
+	private final class ChannelReader extends ChannelThread {
 		private ObjectInputStream is;
 
 		@Override
-		protected void establishConnection() throws IOException {
+		protected void establishConnection(Socket socket) throws IOException {
 			InputStream in = socket.getInputStream();
 			is = new ObjectInputStream(in);
 		}
 
 		@Override
-		@SuppressWarnings({ "unchecked", "rawtypes" })
-		protected void processMessages() throws IOException {
-			while (!isInterrupted()) {
-				// Responding to incoming messages
-				Message message;
+		protected void processMessage() throws IOException {
+			// Responding to incoming messages
+			Message message;
 
-				try {
-					message = (Message) is.readObject();
-				} catch (ClassNotFoundException e) {
-					log.error(e.getLocalizedMessage());
-					// TODO may need to close connection
-					continue;
-				} catch (ClassCastException e) {
-					log.error("Unsupported message type", e);
-					continue;
-				}
-
-				// If it is a response, then we notify the listeners and remove it
-				if (message instanceof Response) {
-					Response response = (Response) message;
-
-					MessageCallback callback = callbacks.remove(response.requestId);
-
-					if (callback == null) {
-						continue;
-					}
-
-					if (response instanceof ErrorResponse) {
-						callback.onFailure(((ErrorResponse) response).getError());
-					} else {
-						try {
-							callback.onSuccess(response.value);
-						} catch (ClassCastException e) {
-							log.error("Unexpected response type", e);
-						} catch (Exception e) {
-							log.error("Unexpected callback failure", e);
-						}
-					}
-				}
-				// Otherwise we try to serve the request
-				else {
-					Message response = transport.execute(message);
-					append(response, null);
-				}
+			try {
+				message = (Message) is.readObject();
+			} catch (ClassNotFoundException e) {
+				log.error(e.getLocalizedMessage());
+				// TODO may need to close connection
+				return;
+			} catch (ClassCastException e) {
+				log.error("Unsupported message type", e);
+				return;
 			}
+
+			channel.process(message);
 		}
 	}
 
-	final class ChannelWriter extends ChannelThread {
+	/**
+	 * Connection thread for sending requests to a remote host.
+	 * 
+	 * @author Gergely Kiss
+	 */
+	private final class ChannelWriter extends ChannelThread {
 		private ObjectOutputStream os;
 
 		@Override
-		protected void establishConnection() throws IOException {
+		protected void establishConnection(Socket socket) throws IOException {
 			OutputStream out = socket.getOutputStream();
 			os = new ObjectOutputStream(out);
 			os.flush();
 		}
 
 		@Override
-		protected void processMessages() throws InterruptedException, IOException {
-			while (!isInterrupted()) {
-				semOutput.acquire();
-				Message message = output.poll();
-				if (message != null) {
+		protected void processMessage() throws InterruptedException, IOException {
+			Message message = channel.waitForOutput();
+			if (message != null) {
+				try {
 					os.writeObject(message);
 					os.reset();
 					os.flush();
+				} catch (IOException e) {
+					channel.offer(message, null);
+					throw e;
 				}
 			}
 		}

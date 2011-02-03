@@ -1,12 +1,12 @@
 package org.ogreg.cortex.transport;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.LinkedList;
@@ -19,6 +19,8 @@ import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.registry.ServiceRegistryImpl;
+import org.ogreg.cortex.transport.SocketTransportImpl.ClientChannelImpl;
+import org.ogreg.cortex.util.ProcessUtils;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -90,16 +92,13 @@ public class SocketTransportImplTest {
 		SocketTransportImpl conn1 = create();
 		conn1.setMinPort(4000);
 		conn1.setMaxPort(4000);
-		conn1.open();
+		conn1.open(1000);
 		SocketTransportImpl conn2 = create();
 		conn2.setMinPort(4000);
 		conn2.setMaxPort(4000);
 
-		try {
-			conn2.open();
-			fail("Expected BindException");
-		} catch (BindException e) {
-		}
+		conn2.open(1000);
+		assertFalse(conn2.listener.isAlive());
 
 		// Other IO error occurred
 		// This is hard to simulate
@@ -164,9 +163,11 @@ public class SocketTransportImplTest {
 		conn1.close();
 		conn1.close();
 		conn2.close();
-		conn1.open();
-		conn2.open();
-		conn2.open();
+		conn1.open(1000);
+		conn2.open(1000);
+		conn2.open(1000);
+
+		address = new InetSocketAddress(conn2.getBoundPort());
 
 		// Second request OK
 		r = conn1.callSync(address, invoke(TestService.class, "add", "abc", "def"), 10000);
@@ -176,7 +177,7 @@ public class SocketTransportImplTest {
 	/**
 	 * Tests a request timeout.
 	 */
-	// @Test(timeOut = 1000)
+	@Test(timeOut = 1000)
 	public void testTimeOuts() throws Throwable {
 		registry.register(new TestService(100), null);
 
@@ -194,20 +195,14 @@ public class SocketTransportImplTest {
 		}
 
 		// Connections should be reopened on next invoke if the local host closed them
-		conn1.closeAllConnections();
-		System.err.println("All closed!");
+		networkFailure(conn1);
 		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"), 1000);
 		assertEquals(r, "12");
 
-		// TODO Connections should be reopened on next invoke if the remote host closed them
-		// Method calls fail if the remote host closed them
-		conn2.closeAllConnections();
-		try {
-			conn1.callSync(address, invoke(TestService.class, "add", "1", "2"), 1000);
-			fail("Expected RemoteException");
-		} catch (RemoteException e) {
-			assertTrue(e.getCause() instanceof IOException, "Expected IOException cause");
-		}
+		// Connections should be reopened on next invoke if the remote host closed them
+		networkFailure(conn2);
+		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"), 1000);
+		assertEquals(r, "12");
 	}
 
 	/**
@@ -241,6 +236,7 @@ public class SocketTransportImplTest {
 
 	@AfterMethod
 	public void tearDown() {
+		System.out.println("TEARDOWN");
 		for (Closeable conn : testConnections) {
 			try {
 				conn.close();
@@ -249,9 +245,9 @@ public class SocketTransportImplTest {
 		}
 	}
 
-	SocketTransportImpl open() throws IOException {
+	SocketTransportImpl open() throws IOException, InterruptedException {
 		SocketTransportImpl conn = create();
-		conn.open();
+		conn.open(1000);
 		return conn;
 	}
 
@@ -281,6 +277,14 @@ public class SocketTransportImplTest {
 		}
 
 		return Invocation.create(identifier, type.getDeclaredMethod(methodName, types), args);
+	}
+
+	void networkFailure(SocketTransportImpl transport) throws InterruptedException {
+		System.out.println("TEST NETWORK FAILURE: " + transport);
+		ProcessUtils.closeQuietly(transport.listener.server);
+		for (ClientChannel channel : transport.channels.values()) {
+			ProcessUtils.closeQuietly(((ClientChannelImpl) channel).connection);
+		}
 	}
 }
 

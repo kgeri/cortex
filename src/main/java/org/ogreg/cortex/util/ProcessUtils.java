@@ -2,6 +2,7 @@ package org.ogreg.cortex.util;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.net.Socket;
 
 /**
@@ -51,6 +52,18 @@ public class ProcessUtils {
 	 * @param closeable
 	 */
 	public static final void closeQuietly(Socket socket) {
+		try {
+			socket.close();
+		} catch (IOException e) {
+		}
+	}
+	
+	/**
+	 * Closes the <code>socket</code> ignoring any IO errors.
+	 * 
+	 * @param closeable
+	 */
+	public static final void closeQuietly(ServerSocket socket) {
 		try {
 			socket.close();
 		} catch (IOException e) {

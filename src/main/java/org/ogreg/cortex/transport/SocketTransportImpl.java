@@ -1,17 +1,19 @@
 package org.ogreg.cortex.transport;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
-import java.net.BindException;
-import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
+import java.net.SocketException;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -46,21 +48,16 @@ public class SocketTransportImpl implements Transport {
 	/** The size of the socket buffers. Default: 32768. */
 	private int socketBufferSize = 32768;
 
-	/** The port on which the server was bound, or 0 if it is not. */
-	int port = 0;
-
 	/** The service registry used to service requests. */
 	private ServiceRegistry registry;
 
 	/** The opened channels towards the remote hosts. */
-	// Package private for testing
-	final Map<String, Connection> connections = new ConcurrentHashMap<String, Connection>(32);
+	final Map<String, ClientChannel> channels = new ConcurrentHashMap<String, ClientChannel>(32);
 
 	/** Parallel executor service for processing incoming requests. */
-	// Package private for testing
 	ExecutorService executor;
 
-	private RequestListener listener;
+	RequestListener listener;
 
 	/**
 	 * Initializes the connector. Must be called prior to {@link #open()}.
@@ -75,49 +72,20 @@ public class SocketTransportImpl implements Transport {
 				new LinkedBlockingQueue<Runnable>());
 	}
 
-	/**
-	 * Binds the transport to one of the ports specified between {@link #minPort} and
-	 * {@link #maxPort} inclusively and starts the listener process.
-	 * 
-	 * @throws BindException if simple bind failed
-	 * @throws IOException on other connection error
-	 */
 	@Override
-	public synchronized void open() throws IOException {
-		if (port > 0) {
+	public synchronized void open(long timeOut) throws InterruptedException {
+		if (listener != null && listener.isAlive()) {
 			return;
 		}
 
-		try {
-			ServerSocket socket = new ServerSocket();
-			socket.setReceiveBufferSize(socketBufferSize);
+		long until = System.currentTimeMillis() + timeOut;
+		SocketBuilder sb = new SocketBuilder().minPort(minPort).maxPort(maxPort)
+				.bufferSize(socketBufferSize);
+		listener = new RequestListener(sb);
 
-			for (port = minPort; port <= maxPort; port++) {
-				try {
-					InetSocketAddress address = new InetSocketAddress(port);
-					socket.bind(address);
-					log.info("Successfully bound to: {}", port);
-					break;
-				} catch (BindException e) {
-					if (port < maxPort) {
-						log.warn("{}: {}, retrying", e.getLocalizedMessage(), port);
-					} else {
-						port = 0;
-						throw new BindException("Port range already in use [" + minPort + "-"
-								+ maxPort + "], giving up");
-					}
-				}
-			}
-
-			listener = new RequestListener(socket);
+		synchronized (listener) {
 			listener.start();
-		} catch (BindException e) {
-			throw e;
-		} catch (IOException e) {
-			port = 0;
-			log.error("Failed to start connector", e);
-			close();
-			throw e;
+			listener.wait(ProcessUtils.check(until, "RequestListener open timed out"));
 		}
 	}
 
@@ -131,47 +99,41 @@ public class SocketTransportImpl implements Transport {
 			listener.interrupt();
 		}
 
-		closeAllConnections();
-
-		listener = null;
-		port = 0;
-
-		log.info("Socket transport closed");
-	}
-
-	void closeAllConnections() {
-		for (Iterator<Connection> it = connections.values().iterator(); it.hasNext();) {
-			Connection connection = it.next();
-			connection.close();
+		for (Iterator<ClientChannel> it = channels.values().iterator(); it.hasNext();) {
+			ClientChannel channel = it.next();
+			channel.destroy();
 			it.remove();
 		}
+
+		listener = null;
+		log.info("Socket transport closed");
 	}
 
 	@Override
 	public Object callSync(SocketAddress address, Message message, long timeOut)
-			throws IOException, InterruptedException, RemoteException {
+			throws InterruptedException, RemoteException {
 		long until = System.currentTimeMillis() + timeOut;
-		Connection conn = getConnection(address, null, until);
 
-		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(conn, message);
-		conn.append(message, callback);
+		ClientChannel channel = getChannel(address, null, until);
+		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(channel, message);
+		channel.offer(message, callback);
 		return callback.waitUntil(until);
 	}
 
 	@Override
 	public <R> void callAsync(SocketAddress address, Message message, long timeOut,
-			MessageCallback<R> callback) throws IOException, InterruptedException {
+			MessageCallback<R> callback) throws InterruptedException {
 		long until = System.currentTimeMillis() + timeOut;
-		Connection conn = getConnection(address, null, until);
-		conn.append(message, callback);
+		ClientChannel conn = getChannel(address, null, until);
+		conn.offer(message, callback);
 	}
 
 	@Override
-	public void callAsync(SocketAddress address, Message message, long timeOut) throws IOException,
-			InterruptedException {
+	public void callAsync(SocketAddress address, Message message, long timeOut)
+			throws InterruptedException {
 		long until = System.currentTimeMillis() + timeOut;
-		Connection conn = getConnection(address, null, until);
-		conn.append(message, null);
+		ClientChannel conn = getChannel(address, null, until);
+		conn.offer(message, null);
 	}
 
 	protected void finalize() throws Throwable {
@@ -208,54 +170,26 @@ public class SocketTransportImpl implements Transport {
 				"Unsupported message: " + message));
 	}
 
-	private Connection getConnection(SocketAddress address, Socket socket, long until)
-			throws IOException, InterruptedException {
+	private ClientChannel getChannel(SocketAddress address, Socket socket, long until)
+			throws InterruptedException {
 		String addr = address.toString().intern();
 
 		synchronized (addr) {
-			Connection connection = connections.get(addr);
-
-			if (connection != null) {
-				if (connection.isOpen() && (socket == null)) {
-					return connection;
-				} else {
-					closeConnection(addr, connection);
-				}
-			}
-
-			if (socket == null) {
-				socket = new Socket();
-				socket.setKeepAlive(true);
-				socket.setReuseAddress(true);
-				socket.setReceiveBufferSize(socketBufferSize);
-				socket.setSendBufferSize(socketBufferSize);
-				socket.connect(address,
-						(int) ProcessUtils.check(until, "Timed out before socket connect"));
-				log.debug("Opened connection to: {}", addr);
-			}
+			ClientChannel channel = channels.get(addr);
 
 			try {
-				connection = new Connection(this, socket);
-				connection.start(until);
-				connections.put(addr, connection);
+				if (channel != null) {
+					return channel.ensureOpen(socket, until);
+				}
 
-				return connection;
+				channel = new ClientChannelImpl(address);
+				channel.ensureOpen(socket, until);
+				channels.put(addr, channel);
+
+				return channel;
 			} catch (InterruptedException e) {
-				closeConnection(addr, connection);
+				channel.destroy();
 				throw e;
-			}
-		}
-	}
-
-	// TODO only reopen instead of close
-	void closeConnection(String addr, Connection connection) {
-		synchronized (addr) {
-			Connection conn = connections.get(addr);
-
-			if (conn != null && conn == connection) {
-				connections.remove(addr);
-				log.debug("Removed and closing connection to: {}", addr);
-				conn.close();
 			}
 		}
 	}
@@ -266,7 +200,7 @@ public class SocketTransportImpl implements Transport {
 	 * @return
 	 */
 	public int getBoundPort() {
-		return port;
+		return listener == null ? -1 : listener.getBoundPort();
 	}
 
 	public void setRegistry(ServiceRegistry registry) {
@@ -285,47 +219,198 @@ public class SocketTransportImpl implements Transport {
 		this.socketBufferSize = socketBufferSize;
 	}
 
-	// Server listener thread
-	private final class RequestListener extends Thread {
-		private final ServerSocket server;
+	// Client transport channel
+	final class ClientChannelImpl implements ClientChannel {
+		private final SocketAddress address;
+		private final Queue<Message> output = new LinkedBlockingQueue<Message>();
+		private final Semaphore semOutput = new Semaphore(0);
+		private final Map<Integer, MessageCallback<?>> callbacks = new ConcurrentHashMap<Integer, MessageCallback<?>>();
 
-		public RequestListener(ServerSocket server) {
-			this.server = server;
-			setName(port + "-RequestListener");
-			setDaemon(true);
+		Connection connection;
+
+		public ClientChannelImpl(SocketAddress address) {
+			this.address = address;
 		}
 
-		public void run() {
-
-			try {
-				while (!isInterrupted()) {
-					Socket socket = server.accept();
-					socket.setReceiveBufferSize(socketBufferSize);
-					socket.setSendBufferSize(socketBufferSize);
-
-					SocketAddress address = socket.getRemoteSocketAddress();
-
-					getConnection(address, socket, System.currentTimeMillis() + 5000);
-
-					log.debug("Received connection from: {}", address);
+		@Override
+		public synchronized ClientChannel ensureOpen(Socket socket, long until)
+				throws InterruptedException {
+			while (true) {
+				try {
+					if (connection == null) {
+						log.debug("Opening connection to: {}", address);
+						socket = openSocket(address, socket, until);
+						connection = new Connection(socket, this);
+						connection.start(until);
+					} else if (!connection.isOpen()
+							|| (socket != null && connection.getSocket() != socket)) {
+						log.debug("Reopening connection to: {}", address);
+						ProcessUtils.closeQuietly(connection);
+						socket = openSocket(address, socket, until);
+						connection = new Connection(socket, this);
+						connection.start(until);
+					}
+					return this;
+				} catch (IOException e) {
+					// TODO separate causes
+					log.error("Failed to open connection to '{}' ({}), retrying in 100ms", address,
+							e.getLocalizedMessage());
+					Thread.sleep(100);
+					ProcessUtils.check(until, "Connection open timed out");
 				}
-			} catch (IOException e) {
-				log.error("RequestListener IO error ({})", e.getLocalizedMessage());
-				log.debug("Failure trace", e);
-			} catch (Throwable e) {
-				log.error("RequestListener FAILED", e);
-			} finally {
-				interrupt();
+			}
+		}
+
+		private Socket openSocket(SocketAddress address, Socket socket, long until)
+				throws IOException, InterruptedException {
+			if (socket == null) {
+				socket = new Socket();
+				socket.setKeepAlive(true);
+				socket.setReuseAddress(true);
+				socket.setReceiveBufferSize(socketBufferSize);
+				socket.setSendBufferSize(socketBufferSize);
+				socket.connect(address,
+						(int) ProcessUtils.check(until, "Timed out before socket connect"));
+				log.debug("Opened connection to: {}", address);
+			}
+			return socket;
+		}
+
+		@Override
+		public <R> void offer(Message message, MessageCallback<R> callback) {
+			if (callback != null) {
+				callbacks.put(message.messageId, callback);
+			}
+			output.add(message);
+			semOutput.release();
+		}
+
+		@Override
+		@SuppressWarnings({ "rawtypes", "unchecked" })
+		public void process(Message message) {
+			// If it is a response, then we notify the listeners and remove it
+			if (message instanceof Response) {
+				Response response = (Response) message;
+
+				MessageCallback callback = callbacks.remove(response.requestId);
+
+				if (callback == null) {
+					return;
+				}
+
+				if (response instanceof ErrorResponse) {
+					callback.onFailure(((ErrorResponse) response).getError());
+				} else {
+					try {
+						callback.onSuccess(response.value);
+					} catch (ClassCastException e) {
+						log.error("Unexpected response type", e);
+					} catch (Exception e) {
+						log.error("Unexpected callback failure", e);
+					}
+				}
+			}
+			// Otherwise we try to serve the request
+			else {
+				Message response = execute(message);
+				offer(response, null);
 			}
 		}
 
 		@Override
-		public void interrupt() {
-			super.interrupt();
-			try {
-				server.close();
-			} catch (IOException e) {
+		public Message waitForOutput() throws InterruptedException {
+			semOutput.acquire();
+			return output.poll();
+		}
+
+		@Override
+		public void destroy() {
+			for (MessageCallback<?> callback : callbacks.values()) {
+				try {
+					callback.onFailure(new IOException("Connection closed"));
+				} catch (Exception e) {
+					log.error("Unexpected callback failure", e);
+				}
 			}
+
+			for (Message message : output) {
+				synchronized (message) {
+					message.notifyAll();
+				}
+			}
+
+			if (connection != null) {
+				ProcessUtils.closeQuietly(connection);
+			}
+		}
+
+		@Override
+		public SocketAddress getAddress() {
+			return null;
+		}
+	}
+
+	// Server listener thread
+	final class RequestListener extends Thread implements Closeable {
+		private final SocketBuilder builder;
+		ServerSocket server;
+
+		public RequestListener(SocketBuilder builder) {
+			this.builder = builder;
+			setDaemon(true);
+		}
+
+		public void run() {
+			try {
+				while (!isInterrupted()) {
+					// Exceptions at this point are fatal
+					server = builder.bind();
+					setName(server.getLocalPort() + "-RequestListener");
+					log.debug("{} started", getName());
+
+					synchronized (this) {
+						notifyAll();
+					}
+
+					try {
+						while (true) {
+							Socket socket = server.accept();
+							socket.setReceiveBufferSize(socketBufferSize);
+							socket.setSendBufferSize(socketBufferSize);
+
+							SocketAddress address = socket.getRemoteSocketAddress();
+
+							getChannel(address, socket, System.currentTimeMillis() + 5000);
+
+							log.debug("Received connection from: {}", address);
+						}
+					} catch (SocketException e) {
+						log.info("{}", e.getLocalizedMessage());
+					} catch (IOException e) {
+						log.error("RequestListener IO error ({})", e.getLocalizedMessage());
+						log.debug("Failure trace", e);
+					}
+					log.debug("Reopening RequestListener in 100ms");
+					sleep(100);
+				}
+			} catch (InterruptedException e) {
+				log.debug("RequestListener was interrupted, closing");
+			} catch (Throwable e) {
+				log.error("RequestListener FAILED", e);
+			} finally {
+				ProcessUtils.closeQuietly(this);
+			}
+		}
+
+		@Override
+		public void close() throws IOException {
+			if (server != null) {
+				server.close();
+			}
+		}
+
+		int getBoundPort() {
+			return server == null ? -1 : server.getLocalPort();
 		}
 	}
 
@@ -335,16 +420,16 @@ public class SocketTransportImpl implements Transport {
 	 * @author Gergely Kiss
 	 * @param <R>
 	 */
-	private static final class SyncMessageCallback<R> implements MessageCallback<R> {
-		private final Connection connection;
+	private final class SyncMessageCallback<R> implements MessageCallback<R> {
+		private final ClientChannel channel;
 		private final Message request;
 
 		private boolean finished = false;
 		private R response;
 		private Throwable error;
 
-		public SyncMessageCallback(Connection connection, Message request) {
-			this.connection = connection;
+		public SyncMessageCallback(ClientChannel channel, Message request) {
+			this.channel = channel;
 			this.request = request;
 		}
 
@@ -366,13 +451,12 @@ public class SocketTransportImpl implements Transport {
 			}
 		}
 
-		public R waitUntil(long until) throws IOException, RemoteException, InterruptedException {
+		public R waitUntil(long until) throws RemoteException, InterruptedException {
 			synchronized (request) {
 				while (!finished) {
-					if (!connection.isOpen()) {
-						throw new IOException("Connection was closed while waiting for response");
-					}
-					ProcessUtils.check(until, "Response timed out");
+					channel.ensureOpen(null, until);
+					ProcessUtils.check(until, "Read timed out");
+					System.err.println(((ClientChannelImpl) channel).connection);
 					request.wait(100);
 				}
 

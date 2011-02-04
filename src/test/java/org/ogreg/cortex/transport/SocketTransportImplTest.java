@@ -7,7 +7,6 @@ import static org.testng.Assert.fail;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.LinkedList;
 import java.util.List;
@@ -19,7 +18,6 @@ import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.registry.ServiceRegistryImpl;
-import org.ogreg.cortex.transport.SocketTransportImpl.ClientChannelImpl;
 import org.ogreg.cortex.util.ProcessUtils;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -47,7 +45,7 @@ public class SocketTransportImplTest {
 		SocketTransportImpl conn1 = open();
 		SocketTransportImpl conn2 = open();
 
-		SocketAddress address = new InetSocketAddress(conn2.getBoundPort());
+		SocketAddress address = conn2.getBoundAddress();
 
 		Object r;
 
@@ -115,7 +113,7 @@ public class SocketTransportImplTest {
 		SocketTransportImpl conn1 = open();
 		SocketTransportImpl conn2 = open();
 
-		SocketAddress address = new InetSocketAddress(conn2.getBoundPort());
+		SocketAddress address = conn2.getBoundAddress();
 
 		// Async invoke TODO
 		Invocation message = invoke(TestService.class, "add", "123", "456");
@@ -144,14 +142,14 @@ public class SocketTransportImplTest {
 	/**
 	 * Tests connection closing and opening, double closing and opening.
 	 */
-	@Test(timeOut = 1000)
+	@Test(timeOut = 10000)
 	public void testOpenClose() throws Throwable {
 		registry.register(new TestService(), null);
 
 		SocketTransportImpl conn1 = open();
 		SocketTransportImpl conn2 = open();
 
-		SocketAddress address = new InetSocketAddress(conn2.getBoundPort());
+		SocketAddress address = conn2.getBoundAddress();
 
 		Object r;
 
@@ -167,7 +165,7 @@ public class SocketTransportImplTest {
 		conn2.open(1000);
 		conn2.open(1000);
 
-		address = new InetSocketAddress(conn2.getBoundPort());
+		address = conn2.getBoundAddress();
 
 		// Second request OK
 		r = conn1.callSync(address, invoke(TestService.class, "add", "abc", "def"), 10000);
@@ -184,7 +182,7 @@ public class SocketTransportImplTest {
 		SocketTransportImpl conn1 = open();
 		SocketTransportImpl conn2 = open();
 
-		SocketAddress address = new InetSocketAddress(conn2.getBoundPort());
+		SocketAddress address = conn2.getBoundAddress();
 		Object r;
 
 		// Method invoke timeout should result in an InterruptedException on the client side
@@ -215,7 +213,7 @@ public class SocketTransportImplTest {
 		SocketTransportImpl conn1 = open();
 		SocketTransportImpl conn2 = open();
 
-		SocketAddress address = new InetSocketAddress(conn2.getBoundPort());
+		SocketAddress address = conn2.getBoundAddress();
 
 		// Null message
 		try {
@@ -280,11 +278,13 @@ public class SocketTransportImplTest {
 	}
 
 	void networkFailure(SocketTransportImpl transport) throws InterruptedException {
-		System.out.println("TEST NETWORK FAILURE: " + transport);
 		ProcessUtils.closeQuietly(transport.listener.server);
 		for (ClientChannel channel : transport.channels.values()) {
-			ProcessUtils.closeQuietly(((ClientChannelImpl) channel).connection);
+			ProcessUtils.closeQuietly(((ClientChannelImpl) channel).reader);
+			ProcessUtils.closeQuietly(((ClientChannelImpl) channel).writer);
 		}
+		System.out.println("TEST NETWORK FAILURE: " + transport);
+		// Thread.sleep(1000);
 	}
 }
 

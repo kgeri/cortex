@@ -1,7 +1,6 @@
 package org.ogreg.cortex.transport;
 
 import java.net.Socket;
-import java.net.SocketAddress;
 
 import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
@@ -53,13 +52,6 @@ interface ClientChannel {
 	 * @throws InterruptedException if the connection is still not open at <code>until</code>
 	 */
 	ClientChannel ensureOpen(Socket socket, long until) throws InterruptedException;
-
-	/**
-	 * Returns the address this channel connects to.
-	 * 
-	 * @return
-	 */
-	SocketAddress getAddress();
 
 	/**
 	 * Disposes of the channel's state, and closes all connections quietly.

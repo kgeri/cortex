@@ -2,6 +2,7 @@ package org.ogreg.cortex.transport;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -9,11 +10,9 @@ import java.net.SocketAddress;
 import java.net.SocketException;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -46,7 +45,7 @@ public class SocketTransportImpl implements Transport {
 	private int maxPort = 4100;
 
 	/** The size of the socket buffers. Default: 32768. */
-	private int socketBufferSize = 32768;
+	int socketBufferSize = 32768;
 
 	/** The service registry used to service requests. */
 	private ServiceRegistry registry;
@@ -115,7 +114,7 @@ public class SocketTransportImpl implements Transport {
 		long until = System.currentTimeMillis() + timeOut;
 
 		ClientChannel channel = getChannel(address, null, until);
-		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(channel, message);
+		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(address, message);
 		channel.offer(message, callback);
 		return callback.waitUntil(until);
 	}
@@ -141,7 +140,7 @@ public class SocketTransportImpl implements Transport {
 	}
 
 	/**
-	 * Executes <code>message</code>, and returns a response.
+	 * Executes <code>message</code>, and sends a response.
 	 * <p>
 	 * Should never throw an error, since it's called by the reader thread. On failures, this method
 	 * should return {@link ErrorResponse}s.
@@ -150,7 +149,8 @@ public class SocketTransportImpl implements Transport {
 	 * @param message
 	 * @return
 	 */
-	Message execute(Message message) {
+	void execute(SocketAddress source, Message message) {
+		Response rsp;
 
 		// TODO Use executor
 		if (message instanceof Invocation) {
@@ -158,16 +158,25 @@ public class SocketTransportImpl implements Transport {
 
 			try {
 				Object service = registry.getService(m.getType(), m.getIdentifier());
-				return new Response(message.messageId, m.invoke(service));
+				rsp = new Response(message.messageId, m.invoke(service));
 			} catch (InvocationTargetException e) {
-				return new ErrorResponse(message.messageId, e.getCause());
+				rsp = new ErrorResponse(message.messageId, e.getCause());
 			} catch (Exception e) {
-				return new ErrorResponse(message.messageId, e);
+				rsp = new ErrorResponse(message.messageId, e);
 			}
+		} else {
+			rsp = new ErrorResponse(message.messageId, new UnsupportedOperationException(
+					"Unsupported message: " + message));
 		}
 
-		return new ErrorResponse(message.messageId, new UnsupportedOperationException(
-				"Unsupported message: " + message));
+		// Sending response
+		try {
+			// TODO timeout
+			getChannel(source, null, System.currentTimeMillis() + 1000).offer(rsp, null);
+		} catch (InterruptedException e) {
+			// If this happens, the channel is killed anyway, so we won't propagate the error back
+			// to the reader thread
+		}
 	}
 
 	private ClientChannel getChannel(SocketAddress address, Socket socket, long until)
@@ -182,7 +191,7 @@ public class SocketTransportImpl implements Transport {
 					return channel.ensureOpen(socket, until);
 				}
 
-				channel = new ClientChannelImpl(address);
+				channel = new ClientChannelImpl(this, address);
 				channel.ensureOpen(socket, until);
 				channels.put(addr, channel);
 
@@ -194,13 +203,39 @@ public class SocketTransportImpl implements Transport {
 		}
 	}
 
+	private void registerChannel(Socket socket, long until) {
+		SocketAddress address;
+
+		try {
+			// Incoming host must first identify itself
+			ObjectInputStream ois = new ObjectInputStream(socket.getInputStream());
+			address = (SocketAddress) ois.readObject();
+			log.debug("Received connection from: {}", address);
+
+			getChannel(address, socket, until);
+		} catch (ClassCastException e) {
+			log.error("Failed to accept connection from '" + socket.getRemoteSocketAddress()
+					+ "', unexpected message: {}", e.getLocalizedMessage());
+			ProcessUtils.closeQuietly(socket);
+		} catch (IOException e) {
+			log.error("Failed to accept connection from '" + socket.getRemoteSocketAddress()
+					+ "', IO error while reading header: {}", e.getLocalizedMessage());
+			ProcessUtils.closeQuietly(socket);
+		} catch (Exception e) {
+			log.error(
+					"Unexpected failure while accepting connection from '"
+							+ socket.getRemoteSocketAddress() + "'", e);
+			ProcessUtils.closeQuietly(socket);
+		}
+	}
+
 	/**
-	 * Returns the port on which the connector is listening, or 0 if it is not.
+	 * Returns the address on which the connector is listening, or null if it is not.
 	 * 
 	 * @return
 	 */
-	public int getBoundPort() {
-		return listener == null ? -1 : listener.getBoundPort();
+	public SocketAddress getBoundAddress() {
+		return listener == null ? null : listener.getBoundAddress();
 	}
 
 	public void setRegistry(ServiceRegistry registry) {
@@ -217,137 +252,6 @@ public class SocketTransportImpl implements Transport {
 
 	public void setSocketBufferSize(int socketBufferSize) {
 		this.socketBufferSize = socketBufferSize;
-	}
-
-	// Client transport channel
-	final class ClientChannelImpl implements ClientChannel {
-		private final SocketAddress address;
-		private final Queue<Message> output = new LinkedBlockingQueue<Message>();
-		private final Semaphore semOutput = new Semaphore(0);
-		private final Map<Integer, MessageCallback<?>> callbacks = new ConcurrentHashMap<Integer, MessageCallback<?>>();
-
-		Connection connection;
-
-		public ClientChannelImpl(SocketAddress address) {
-			this.address = address;
-		}
-
-		@Override
-		public synchronized ClientChannel ensureOpen(Socket socket, long until)
-				throws InterruptedException {
-			while (true) {
-				try {
-					if (connection == null) {
-						log.debug("Opening connection to: {}", address);
-						socket = openSocket(address, socket, until);
-						connection = new Connection(socket, this);
-						connection.start(until);
-					} else if (!connection.isOpen()
-							|| (socket != null && connection.getSocket() != socket)) {
-						log.debug("Reopening connection to: {}", address);
-						ProcessUtils.closeQuietly(connection);
-						socket = openSocket(address, socket, until);
-						connection = new Connection(socket, this);
-						connection.start(until);
-					}
-					return this;
-				} catch (IOException e) {
-					// TODO separate causes
-					log.error("Failed to open connection to '{}' ({}), retrying in 100ms", address,
-							e.getLocalizedMessage());
-					Thread.sleep(100);
-					ProcessUtils.check(until, "Connection open timed out");
-				}
-			}
-		}
-
-		private Socket openSocket(SocketAddress address, Socket socket, long until)
-				throws IOException, InterruptedException {
-			if (socket == null) {
-				socket = new Socket();
-				socket.setKeepAlive(true);
-				socket.setReuseAddress(true);
-				socket.setReceiveBufferSize(socketBufferSize);
-				socket.setSendBufferSize(socketBufferSize);
-				socket.connect(address,
-						(int) ProcessUtils.check(until, "Timed out before socket connect"));
-				log.debug("Opened connection to: {}", address);
-			}
-			return socket;
-		}
-
-		@Override
-		public <R> void offer(Message message, MessageCallback<R> callback) {
-			if (callback != null) {
-				callbacks.put(message.messageId, callback);
-			}
-			output.add(message);
-			semOutput.release();
-		}
-
-		@Override
-		@SuppressWarnings({ "rawtypes", "unchecked" })
-		public void process(Message message) {
-			// If it is a response, then we notify the listeners and remove it
-			if (message instanceof Response) {
-				Response response = (Response) message;
-
-				MessageCallback callback = callbacks.remove(response.requestId);
-
-				if (callback == null) {
-					return;
-				}
-
-				if (response instanceof ErrorResponse) {
-					callback.onFailure(((ErrorResponse) response).getError());
-				} else {
-					try {
-						callback.onSuccess(response.value);
-					} catch (ClassCastException e) {
-						log.error("Unexpected response type", e);
-					} catch (Exception e) {
-						log.error("Unexpected callback failure", e);
-					}
-				}
-			}
-			// Otherwise we try to serve the request
-			else {
-				Message response = execute(message);
-				offer(response, null);
-			}
-		}
-
-		@Override
-		public Message waitForOutput() throws InterruptedException {
-			semOutput.acquire();
-			return output.poll();
-		}
-
-		@Override
-		public void destroy() {
-			for (MessageCallback<?> callback : callbacks.values()) {
-				try {
-					callback.onFailure(new IOException("Connection closed"));
-				} catch (Exception e) {
-					log.error("Unexpected callback failure", e);
-				}
-			}
-
-			for (Message message : output) {
-				synchronized (message) {
-					message.notifyAll();
-				}
-			}
-
-			if (connection != null) {
-				ProcessUtils.closeQuietly(connection);
-			}
-		}
-
-		@Override
-		public SocketAddress getAddress() {
-			return null;
-		}
 	}
 
 	// Server listener thread
@@ -377,12 +281,10 @@ public class SocketTransportImpl implements Transport {
 							Socket socket = server.accept();
 							socket.setReceiveBufferSize(socketBufferSize);
 							socket.setSendBufferSize(socketBufferSize);
+							socket.setSoTimeout(5000); // TODO timeout
 
-							SocketAddress address = socket.getRemoteSocketAddress();
-
-							getChannel(address, socket, System.currentTimeMillis() + 5000);
-
-							log.debug("Received connection from: {}", address);
+							// TODO timeout
+							registerChannel(socket, System.currentTimeMillis() + 5000);
 						}
 					} catch (SocketException e) {
 						log.info("{}", e.getLocalizedMessage());
@@ -409,8 +311,8 @@ public class SocketTransportImpl implements Transport {
 			}
 		}
 
-		int getBoundPort() {
-			return server == null ? -1 : server.getLocalPort();
+		SocketAddress getBoundAddress() {
+			return server == null ? null : server.getLocalSocketAddress();
 		}
 	}
 
@@ -421,15 +323,15 @@ public class SocketTransportImpl implements Transport {
 	 * @param <R>
 	 */
 	private final class SyncMessageCallback<R> implements MessageCallback<R> {
-		private final ClientChannel channel;
+		private final SocketAddress address;
 		private final Message request;
 
 		private boolean finished = false;
 		private R response;
 		private Throwable error;
 
-		public SyncMessageCallback(ClientChannel channel, Message request) {
-			this.channel = channel;
+		public SyncMessageCallback(SocketAddress address, Message request) {
+			this.address = address;
 			this.request = request;
 		}
 
@@ -454,9 +356,9 @@ public class SocketTransportImpl implements Transport {
 		public R waitUntil(long until) throws RemoteException, InterruptedException {
 			synchronized (request) {
 				while (!finished) {
-					channel.ensureOpen(null, until);
+					getChannel(address, null, until);
 					ProcessUtils.check(until, "Read timed out");
-					System.err.println(((ClientChannelImpl) channel).connection);
+					System.err.println("Waiting for " + address);
 					request.wait(100);
 				}
 

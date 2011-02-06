@@ -13,13 +13,6 @@ import org.ogreg.cortex.message.MessageCallback;
 interface ClientChannel {
 
 	/**
-	 * Processes the incoming message.
-	 * 
-	 * @param message
-	 */
-	void process(Message message);
-
-	/**
 	 * Offers <code>message</code> to this channel's output queue, and notifies
 	 * <code>callback</code> when the response is received.
 	 * <p>
@@ -32,15 +25,15 @@ interface ClientChannel {
 	 * @param callback The callback to notify when the response is received, or null if no
 	 *            notification is required
 	 */
-	<R> void offer(Message message, MessageCallback<R> object);
+	<R> void send(Message message, MessageCallback<R> object);
 
 	/**
-	 * Ensures that this channel has an open connection.
+	 * Ensures that this channel has an open connection for reading and writing.
 	 * 
-	 * @param socket The socket to use for this channel, or null if the channel should use its
-	 *            current socket
-	 * @param until The time to wait until the connection is open
-	 * @return
+	 * @param socket The socket to use for this channel, or null if the channel should open a new
+	 *            socket
+	 * @param until The deadline to wait until the connection is open
+	 * @return this channel
 	 * @throws InterruptedException if the connection is still not open at <code>until</code>
 	 */
 	ClientChannel ensureOpen(Socket socket, long until) throws InterruptedException;
@@ -50,5 +43,19 @@ interface ClientChannel {
 	 */
 	void destroy();
 
+	/**
+	 * Processes the incoming message. Used by the {@link ChannelReader}.
+	 * 
+	 * @param message
+	 */
+	void processInput(Message message);
+
+	/**
+	 * Reads the next output message from this channel's output queue. The call blocks until one is
+	 * available. Used by the {@link ChannelWriter}.
+	 * 
+	 * @return
+	 * @throws InterruptedException
+	 */
 	Message takeOutput() throws InterruptedException;
 }

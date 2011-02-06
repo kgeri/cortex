@@ -3,6 +3,7 @@ package org.ogreg.cortex.transport;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -26,6 +27,7 @@ import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.message.Response;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.util.ProcessUtils;
+import org.ogreg.cortex.util.ServerSocketBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,7 +37,7 @@ import org.slf4j.LoggerFactory;
  * 
  * @author Gergely Kiss
  */
-public class SocketTransportImpl implements Transport {
+public class SocketTransportImpl implements SocketTransport {
 	static final Logger log = LoggerFactory.getLogger(SocketTransportImpl.class);
 
 	/** The start of the usable port range (inclusive). */
@@ -78,8 +80,8 @@ public class SocketTransportImpl implements Transport {
 		}
 
 		long until = System.currentTimeMillis() + timeOut;
-		SocketBuilder sb = new SocketBuilder().minPort(minPort).maxPort(maxPort)
-				.bufferSize(socketBufferSize);
+		ServerSocketBuilder sb = new ServerSocketBuilder().minPort(minPort).maxPort(maxPort)
+				.bufferSize(socketBufferSize).log(log);
 		listener = new RequestListener(sb);
 
 		synchronized (listener) {
@@ -112,10 +114,8 @@ public class SocketTransportImpl implements Transport {
 	public Object callSync(SocketAddress address, Message message, long timeOut)
 			throws InterruptedException, RemoteException {
 		long until = System.currentTimeMillis() + timeOut;
-
-		ClientChannel channel = getChannel(address, null, until);
 		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(address, message);
-		channel.offer(message, callback);
+		getChannel(address).ensureOpen(null, until).send(message, callback);
 		return callback.waitUntil(until);
 	}
 
@@ -123,41 +123,31 @@ public class SocketTransportImpl implements Transport {
 	public <R> void callAsync(SocketAddress address, Message message, long timeOut,
 			MessageCallback<R> callback) throws InterruptedException {
 		long until = System.currentTimeMillis() + timeOut;
-		ClientChannel conn = getChannel(address, null, until);
-		conn.offer(message, callback);
+		getChannel(address).ensureOpen(null, until).send(message, callback);
 	}
 
 	@Override
 	public void callAsync(SocketAddress address, Message message, long timeOut)
 			throws InterruptedException {
 		long until = System.currentTimeMillis() + timeOut;
-		ClientChannel conn = getChannel(address, null, until);
-		conn.offer(message, null);
+		getChannel(address).ensureOpen(null, until).send(message, null);
 	}
 
 	protected void finalize() throws Throwable {
 		close();
 	}
 
-	/**
-	 * Executes <code>message</code>, and sends a response.
-	 * <p>
-	 * Should never throw an error, since it's called by the reader thread. On failures, this method
-	 * should return {@link ErrorResponse}s.
-	 * </p>
-	 * 
-	 * @param message
-	 * @return
-	 */
-	void execute(final SocketAddress source, final Message message) {
+	@Override
+	public void execute(final SocketAddress source, final Message message) {
 		executor.submit(new Runnable() {
 			@Override
 			public void run() {
 				Response rsp = execute(message);
 
 				try {
-					// TODO timeout
-					getChannel(source, null, System.currentTimeMillis() + 1000).offer(rsp, null);
+					// TODO magic number
+					getChannel(source).ensureOpen(null, System.currentTimeMillis() + 1000).send(
+							rsp, null);
 				} catch (Exception e) {
 					log.error("Failed to send response", e);
 				}
@@ -183,40 +173,52 @@ public class SocketTransportImpl implements Transport {
 		}
 	}
 
-	private ClientChannel getChannel(SocketAddress address, Socket socket, long until)
-			throws InterruptedException {
+	private ClientChannel getChannel(SocketAddress address) {
 		String addr = address.toString().intern();
 
 		synchronized (addr) {
 			ClientChannel channel = channels.get(addr);
 
-			try {
-				if (channel != null) {
-					return channel.ensureOpen(socket, until);
-				}
-
-				channel = new ClientChannelImpl(this, address);
-				channel.ensureOpen(socket, until);
-				channels.put(addr, channel);
-
+			if (channel != null) {
 				return channel;
-			} catch (InterruptedException e) {
-				channel.destroy();
-				throw e;
 			}
+
+			channel = new ClientChannelImpl(this, address);
+			channels.put(addr, channel);
+
+			return channel;
 		}
 	}
 
-	private void registerChannel(Socket socket, long until) {
+	@Override
+	public Socket openSocket(SocketAddress address, long until) throws IOException,
+			InterruptedException {
+		Socket socket = new Socket();
+		socket.setKeepAlive(true);
+		socket.setReuseAddress(true);
+		socket.setReceiveBufferSize(socketBufferSize);
+		socket.setSendBufferSize(socketBufferSize);
+		socket.setSoTimeout(5000); // TODO timeout
+		socket.connect(address, (int) ProcessUtils.check(until, "Timed out before socket connect"));
+
+		// Protocol: First message sent is the address where our server is available
+		ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+		oos.writeObject(getBoundAddress());
+
+		return socket;
+	}
+
+	private void registerChannel(Socket socket) {
 		SocketAddress address;
 
 		try {
-			// Incoming host must first identify itself
+			// Protocol: Incoming host must first identify itself by providing it's server address
 			ObjectInputStream ois = new ObjectInputStream(socket.getInputStream());
 			address = (SocketAddress) ois.readObject();
 			log.debug("Received connection from: {}", address);
 
-			getChannel(address, socket, until);
+			// TODO magic number
+			getChannel(address).ensureOpen(socket, System.currentTimeMillis() + 5000);
 		} catch (ClassCastException e) {
 			log.error("Failed to accept connection from '" + socket.getRemoteSocketAddress()
 					+ "', unexpected message: {}", e.getLocalizedMessage());
@@ -260,10 +262,10 @@ public class SocketTransportImpl implements Transport {
 
 	// Server listener thread
 	final class RequestListener extends Thread implements Closeable {
-		private final SocketBuilder builder;
+		private final ServerSocketBuilder builder;
 		ServerSocket server;
 
-		public RequestListener(SocketBuilder builder) {
+		public RequestListener(ServerSocketBuilder builder) {
 			this.builder = builder;
 			setDaemon(true);
 		}
@@ -288,7 +290,7 @@ public class SocketTransportImpl implements Transport {
 							socket.setSoTimeout(5000); // TODO timeout
 
 							// TODO timeout
-							registerChannel(socket, System.currentTimeMillis() + 5000);
+							registerChannel(socket);
 						}
 					} catch (SocketException e) {
 						log.info("{}", e.getLocalizedMessage());
@@ -360,7 +362,7 @@ public class SocketTransportImpl implements Transport {
 		public R waitUntil(long until) throws RemoteException, InterruptedException {
 			synchronized (request) {
 				while (!finished) {
-					getChannel(address, null, until);
+					getChannel(address).ensureOpen(null, until);
 					ProcessUtils.check(until, "Read timed out");
 					request.wait(100);
 				}

@@ -1,7 +1,6 @@
 package org.ogreg.cortex.transport;
 
 import java.io.IOException;
-import java.io.ObjectOutputStream;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.util.Map;
@@ -17,10 +16,21 @@ import org.ogreg.cortex.util.ProcessUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * The default client channel implementation.
+ * <p>
+ * The {@link ClientChannel} is responsible for holding the state of the connection to a specified
+ * remote address. The channel is asynchronous, messages may be sent by
+ * {@link #send(Message, MessageCallback)}-ing them through the channel's output queue, and
+ * responses may be received by registering a callback.
+ * </p>
+ * 
+ * @author Gergely Kiss
+ */
 class ClientChannelImpl implements ClientChannel {
 	private static final Logger log = LoggerFactory.getLogger(ClientChannelImpl.class);
 
-	private final SocketTransportImpl socketTransportImpl;
+	private final SocketTransport parent;
 	private final SocketAddress address;
 
 	private final BlockingQueue<Message> output = new LinkedBlockingQueue<Message>();
@@ -29,8 +39,8 @@ class ClientChannelImpl implements ClientChannel {
 	AbstractChannelProcess reader;
 	AbstractChannelProcess writer;
 
-	public ClientChannelImpl(SocketTransportImpl socketTransportImpl, SocketAddress address) {
-		this.socketTransportImpl = socketTransportImpl;
+	public ClientChannelImpl(SocketTransport parent, SocketAddress address) {
+		this.parent = parent;
 		this.address = address;
 	}
 
@@ -42,14 +52,14 @@ class ClientChannelImpl implements ClientChannel {
 				// Ensure writer is open and bound to the socket if specified
 				if (writer == null) {
 					log.debug("Opening writer to: {}", address);
-					socket = openSocket(address, socket, until);
+					socket = openSocket(socket, until);
 					writer = new ChannelWriter(this, socket);
 					writer.setName("ChannelWriter-" + address);
 					writer.open(until);
 				} else if (!writer.isOpen() || (socket != null && writer.getSocket() != socket)) {
 					log.debug("Reopening writer to: {}", address);
 					ProcessUtils.closeQuietly(writer);
-					socket = openSocket(address, socket, until);
+					socket = openSocket(socket, until);
 					writer = new ChannelWriter(this, socket);
 					writer.setName("ChannelWriter-" + address);
 					writer.open(until);
@@ -58,14 +68,14 @@ class ClientChannelImpl implements ClientChannel {
 				// Ensure reader is open and bound to the socket if specified
 				if (reader == null) {
 					log.debug("Opening reader to: {}", address);
-					socket = openSocket(address, socket, until);
+					socket = openSocket(socket, until);
 					reader = new ChannelReader(this, socket);
 					reader.setName("ChannelReader-" + address);
 					reader.open(until);
 				} else if (!reader.isOpen() || (socket != null && reader.getSocket() != socket)) {
 					log.debug("Reopening reader to: {}", address);
 					ProcessUtils.closeQuietly(reader);
-					socket = openSocket(address, socket, until);
+					socket = openSocket(socket, until);
 					reader = new ChannelReader(this, socket);
 					reader.setName("ChannelReader-" + address);
 					reader.open(until);
@@ -76,27 +86,18 @@ class ClientChannelImpl implements ClientChannel {
 				// TODO separate causes
 				log.error("Failed to open connection to '{}' ({}), retrying in 100ms", address,
 						e.getLocalizedMessage());
+
+				// TODO magic number
 				Thread.sleep(100);
 				ProcessUtils.check(until, "Connection open timed out");
 			}
 		}
 	}
 
-	private Socket openSocket(SocketAddress address, Socket socket, long until) throws IOException,
-			InterruptedException {
+	private Socket openSocket(Socket socket, long until) throws IOException, InterruptedException {
 		if (socket == null) {
-			socket = new Socket();
-			socket.setKeepAlive(true);
-			socket.setReuseAddress(true);
-			socket.setReceiveBufferSize(this.socketTransportImpl.socketBufferSize);
-			socket.setSendBufferSize(this.socketTransportImpl.socketBufferSize);
-			socket.setSoTimeout(5000); // TODO timeout
-			socket.connect(address,
-					(int) ProcessUtils.check(until, "Timed out before socket connect"));
+			socket = parent.openSocket(address, until);
 			log.debug("Opened socket to: {}", address);
-
-			ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
-			oos.writeObject(this.socketTransportImpl.getBoundAddress());
 		} else {
 			log.debug("Reused existing socket to: {}", address);
 		}
@@ -104,7 +105,7 @@ class ClientChannelImpl implements ClientChannel {
 	}
 
 	@Override
-	public <R> void offer(Message message, MessageCallback<R> callback) {
+	public <R> void send(Message message, MessageCallback<R> callback) {
 		if (callback != null) {
 			callbacks.put(message.messageId, callback);
 		}
@@ -113,7 +114,7 @@ class ClientChannelImpl implements ClientChannel {
 
 	@Override
 	@SuppressWarnings({ "rawtypes", "unchecked" })
-	public void process(Message message) {
+	public void processInput(Message message) {
 		// If it is a response, then we notify the listeners and remove it
 		if (message instanceof Response) {
 			Response response = (Response) message;
@@ -138,7 +139,7 @@ class ClientChannelImpl implements ClientChannel {
 		}
 		// Otherwise we try to serve the request
 		else {
-			this.socketTransportImpl.execute(address, message);
+			parent.execute(address, message);
 		}
 	}
 

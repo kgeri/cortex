@@ -37,7 +37,7 @@ final class ChannelWriter extends AbstractChannelProcess {
 				os.flush();
 				System.out.println(getName() + " SENT: " + message);
 			} catch (IOException e) {
-				channel.offer(message, null);
+				channel.send(message, null);
 				throw e;
 			}
 		}

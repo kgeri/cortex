@@ -214,7 +214,7 @@ public class SocketTransportImplTest {
 	/**
 	 * Tests a request timeout.
 	 */
-	@Test(timeOut = 1000)
+	@Test(timeOut = 100000)
 	public void testErrors() throws Throwable {
 		registry.register(new TestService(100), null);
 
@@ -232,7 +232,7 @@ public class SocketTransportImplTest {
 
 		// Unsupported message type
 		try {
-			conn1.callSync(address, new DummyMessage(), 1000);
+			conn1.callSync(address, new DummyMessage(), 100000);
 			fail("Expected RemoteException");
 		} catch (RemoteException e) {
 			assertTrue(e.getCause() instanceof UnsupportedOperationException,

@@ -45,6 +45,6 @@ final class ChannelReader extends AbstractChannelProcess {
 			return;
 		}
 
-		channel.process(message);
+		channel.processInput(message);
 	}
 }

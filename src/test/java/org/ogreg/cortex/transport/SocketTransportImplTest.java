@@ -25,7 +25,7 @@ import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-@Test
+@Test(groups = "correctness")
 public class SocketTransportImplTest {
 	private List<Closeable> testConnections = new LinkedList<Closeable>();
 	ServiceRegistry registry = new ServiceRegistryImpl();
@@ -214,7 +214,7 @@ public class SocketTransportImplTest {
 	/**
 	 * Tests a request timeout.
 	 */
-	@Test(timeOut = 100000)
+	@Test(timeOut = 1000)
 	public void testErrors() throws Throwable {
 		registry.register(new TestService(100), null);
 
@@ -232,15 +232,23 @@ public class SocketTransportImplTest {
 
 		// Unsupported message type
 		try {
-			conn1.callSync(address, new DummyMessage(), 100000);
+			conn1.callSync(address, new DummyMessage(), 1000);
 			fail("Expected RemoteException");
 		} catch (RemoteException e) {
 			assertTrue(e.getCause() instanceof UnsupportedOperationException,
 					"Expected UnsupportedOperationException cause");
 		}
 
-		// // Failure to open connection TODO
-		// conn1.callAsync(new InetSocketAddress(3000), new DummyMessage(), 0);
+		// Unknown address
+		try {
+			conn1.callAsync(new InetSocketAddress(3000), new DummyMessage(), 100);
+			fail("Expected InterruptedException");
+		} catch (InterruptedException e) {
+		}
+
+		// Failed to send response
+		conn2.setResponseSendTimeOut(-1); // A little hack :)
+		conn1.callAsync(address, new DummyMessage(), 0);
 	}
 
 	@AfterMethod

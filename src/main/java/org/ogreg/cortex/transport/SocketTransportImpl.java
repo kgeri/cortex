@@ -47,7 +47,24 @@ public class SocketTransportImpl implements SocketTransport {
 	private int maxPort = 4100;
 
 	/** The size of the socket buffers. Default: 32768. */
-	int socketBufferSize = 32768;
+	private int socketBufferSize = 32768;
+
+	/**
+	 * The maximum number of milliseconds to wait for connection opening when sending a response.
+	 * Default: 1000 ms.
+	 */
+	private int responseSendTimeOut = 1000;
+
+	/**
+	 * The maximum number of milliseconds to wait for connection opening when accepting a
+	 * connection. Default: 1000 ms.
+	 */
+	private int acceptTimeOut = 1000;
+
+	/**
+	 * The SO_TIMEOUT value for all opened sockets. Default: 5000 ms.
+	 */
+	private int soTimeOut = 5000;
 
 	/** The service registry used to service requests. */
 	private ServiceRegistry registry;
@@ -145,9 +162,8 @@ public class SocketTransportImpl implements SocketTransport {
 				Response rsp = execute(message);
 
 				try {
-					// TODO magic number
-					getChannel(source).ensureOpen(null, System.currentTimeMillis() + 1000).send(
-							rsp, null);
+					getChannel(source).ensureOpen(null,
+							System.currentTimeMillis() + responseSendTimeOut).send(rsp, null);
 				} catch (Exception e) {
 					log.error("Failed to send response", e);
 				}
@@ -198,7 +214,7 @@ public class SocketTransportImpl implements SocketTransport {
 		socket.setReuseAddress(true);
 		socket.setReceiveBufferSize(socketBufferSize);
 		socket.setSendBufferSize(socketBufferSize);
-		socket.setSoTimeout(5000); // TODO timeout
+		socket.setSoTimeout(soTimeOut);
 		socket.connect(address, (int) ProcessUtils.check(until, "Timed out before socket connect"));
 
 		// Protocol: First message sent is the address where our server is available
@@ -217,8 +233,7 @@ public class SocketTransportImpl implements SocketTransport {
 			address = (SocketAddress) ois.readObject();
 			log.debug("Received connection from: {}", address);
 
-			// TODO magic number
-			getChannel(address).ensureOpen(socket, System.currentTimeMillis() + 5000);
+			getChannel(address).ensureOpen(socket, System.currentTimeMillis() + acceptTimeOut);
 		} catch (ClassCastException e) {
 			log.error("Failed to accept connection from '" + socket.getRemoteSocketAddress()
 					+ "', unexpected message: {}", e.getLocalizedMessage());
@@ -260,6 +275,18 @@ public class SocketTransportImpl implements SocketTransport {
 		this.socketBufferSize = socketBufferSize;
 	}
 
+	public void setResponseSendTimeOut(int responseSendTimeOut) {
+		this.responseSendTimeOut = responseSendTimeOut;
+	}
+
+	public void setAcceptTimeOut(int acceptTimeOut) {
+		this.acceptTimeOut = acceptTimeOut;
+	}
+
+	public void setSoTimeOut(int soTimeOut) {
+		this.soTimeOut = soTimeOut;
+	}
+
 	// Server listener thread
 	final class RequestListener extends Thread implements Closeable {
 		private final ServerSocketBuilder builder;
@@ -287,9 +314,8 @@ public class SocketTransportImpl implements SocketTransport {
 							Socket socket = server.accept();
 							socket.setReceiveBufferSize(socketBufferSize);
 							socket.setSendBufferSize(socketBufferSize);
-							socket.setSoTimeout(5000); // TODO timeout
+							socket.setSoTimeout(soTimeOut);
 
-							// TODO timeout
 							registerChannel(socket);
 						}
 					} catch (SocketException e) {

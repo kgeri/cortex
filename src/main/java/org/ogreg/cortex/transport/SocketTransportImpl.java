@@ -149,33 +149,37 @@ public class SocketTransportImpl implements Transport {
 	 * @param message
 	 * @return
 	 */
-	void execute(SocketAddress source, Message message) {
-		Response rsp;
+	void execute(final SocketAddress source, final Message message) {
+		executor.submit(new Runnable() {
+			@Override
+			public void run() {
+				Response rsp = execute(message);
 
-		// TODO Use executor
+				try {
+					// TODO timeout
+					getChannel(source, null, System.currentTimeMillis() + 1000).offer(rsp, null);
+				} catch (Exception e) {
+					log.error("Failed to send response", e);
+				}
+			}
+		});
+	}
+
+	private Response execute(Message message) {
 		if (message instanceof Invocation) {
 			Invocation m = (Invocation) message;
 
 			try {
 				Object service = registry.getService(m.getType(), m.getIdentifier());
-				rsp = new Response(message.messageId, m.invoke(service));
+				return new Response(message.messageId, m.invoke(service));
 			} catch (InvocationTargetException e) {
-				rsp = new ErrorResponse(message.messageId, e.getCause());
+				return new ErrorResponse(message.messageId, e.getCause());
 			} catch (Exception e) {
-				rsp = new ErrorResponse(message.messageId, e);
+				return new ErrorResponse(message.messageId, e);
 			}
 		} else {
-			rsp = new ErrorResponse(message.messageId, new UnsupportedOperationException(
+			return new ErrorResponse(message.messageId, new UnsupportedOperationException(
 					"Unsupported message: " + message));
-		}
-
-		// Sending response
-		try {
-			// TODO timeout
-			getChannel(source, null, System.currentTimeMillis() + 1000).offer(rsp, null);
-		} catch (InterruptedException e) {
-			// If this happens, the channel is killed anyway, so we won't propagate the error back
-			// to the reader thread
 		}
 	}
 
@@ -358,7 +362,6 @@ public class SocketTransportImpl implements Transport {
 				while (!finished) {
 					getChannel(address, null, until);
 					ProcessUtils.check(until, "Read timed out");
-					System.err.println("Waiting for " + address);
 					request.wait(100);
 				}
 

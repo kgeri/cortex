@@ -5,10 +5,9 @@ import java.io.ObjectOutputStream;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.util.Map;
-import java.util.Queue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
 
 import org.ogreg.cortex.message.ErrorResponse;
 import org.ogreg.cortex.message.Message;
@@ -24,8 +23,7 @@ class ClientChannelImpl implements ClientChannel {
 	private final SocketTransportImpl socketTransportImpl;
 	private final SocketAddress address;
 
-	private final Queue<Message> output = new LinkedBlockingQueue<Message>();
-	private final Semaphore semOutput = new Semaphore(0);
+	private final BlockingQueue<Message> output = new LinkedBlockingQueue<Message>();
 	private final Map<Integer, MessageCallback<?>> callbacks = new ConcurrentHashMap<Integer, MessageCallback<?>>();
 
 	AbstractChannelProcess reader;
@@ -110,8 +108,7 @@ class ClientChannelImpl implements ClientChannel {
 		if (callback != null) {
 			callbacks.put(message.messageId, callback);
 		}
-		output.add(message);
-		semOutput.release();
+		output.offer(message);
 	}
 
 	@Override
@@ -146,12 +143,6 @@ class ClientChannelImpl implements ClientChannel {
 	}
 
 	@Override
-	public Message waitForOutput() throws InterruptedException {
-		semOutput.acquire();
-		return output.poll();
-	}
-
-	@Override
 	public void destroy() {
 		for (MessageCallback<?> callback : callbacks.values()) {
 			try {
@@ -160,12 +151,14 @@ class ClientChannelImpl implements ClientChannel {
 				log.error("Unexpected callback failure", e);
 			}
 		}
+		callbacks.clear();
 
 		for (Message message : output) {
 			synchronized (message) {
 				message.notifyAll();
 			}
 		}
+		output.clear();
 
 		if (reader != null) {
 			ProcessUtils.closeQuietly(reader);
@@ -173,5 +166,10 @@ class ClientChannelImpl implements ClientChannel {
 		if (writer != null) {
 			ProcessUtils.closeQuietly(writer);
 		}
+	}
+
+	@Override
+	public Message takeOutput() throws InterruptedException {
+		return output.take();
 	}
 }

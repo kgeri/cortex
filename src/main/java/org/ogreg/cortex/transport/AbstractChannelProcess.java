@@ -23,6 +23,8 @@ abstract class AbstractChannelProcess extends Thread implements Closeable {
 	public AbstractChannelProcess(ClientChannel channel, Socket socket) {
 		this.channel = channel;
 		this.socket = socket;
+		
+		setDaemon(true);
 	}
 
 	public Socket getSocket() {

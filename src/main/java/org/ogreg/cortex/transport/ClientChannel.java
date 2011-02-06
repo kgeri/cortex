@@ -35,14 +35,6 @@ interface ClientChannel {
 	<R> void offer(Message message, MessageCallback<R> object);
 
 	/**
-	 * Blocks until the channel has an output in its queue, then returns the message to send.
-	 * 
-	 * @return
-	 * @throws InterruptedException
-	 */
-	Message waitForOutput() throws InterruptedException;
-
-	/**
 	 * Ensures that this channel has an open connection.
 	 * 
 	 * @param socket The socket to use for this channel, or null if the channel should use its
@@ -57,4 +49,6 @@ interface ClientChannel {
 	 * Disposes of the channel's state, and closes all connections quietly.
 	 */
 	void destroy();
+
+	Message takeOutput() throws InterruptedException;
 }

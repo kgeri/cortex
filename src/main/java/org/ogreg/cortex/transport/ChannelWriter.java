@@ -29,7 +29,7 @@ final class ChannelWriter extends AbstractChannelProcess {
 	@Override
 	protected void processMessage() throws InterruptedException, IOException {
 		ClientChannel channel = ensureAttached();
-		Message message = channel.waitForOutput();
+		Message message = channel.takeOutput();
 		if (message != null) {
 			try {
 				os.writeObject(message);

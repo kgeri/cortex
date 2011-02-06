@@ -7,6 +7,7 @@ import static org.testng.Assert.fail;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.LinkedList;
 import java.util.List;
@@ -18,6 +19,7 @@ import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.registry.ServiceRegistryImpl;
+import org.ogreg.cortex.transport.SocketTransportImpl.RequestListener;
 import org.ogreg.cortex.util.ProcessUtils;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -170,6 +172,12 @@ public class SocketTransportImplTest {
 		// Second request OK
 		r = conn1.callSync(address, invoke(TestService.class, "add", "abc", "def"), 10000);
 		assertEquals(r, "abcdef");
+
+		// Closing by finalizer
+		RequestListener tmp = conn1.listener;
+		conn1.finalize();
+		Thread.sleep(100);
+		assertTrue(tmp.isAlive());
 	}
 
 	/**
@@ -230,6 +238,9 @@ public class SocketTransportImplTest {
 			assertTrue(e.getCause() instanceof UnsupportedOperationException,
 					"Expected UnsupportedOperationException cause");
 		}
+
+		// // Failure to open connection TODO
+		// conn1.callAsync(new InetSocketAddress(3000), new DummyMessage(), 0);
 	}
 
 	@AfterMethod

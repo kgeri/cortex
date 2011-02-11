@@ -1,27 +1,21 @@
 package org.ogreg.cortex.transport;
 
-import java.io.Closeable;
+ import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.MulticastSocket;
 import java.net.SocketTimeoutException;
-import java.net.UnknownHostException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 import javax.annotation.PostConstruct;
 
-import org.ogreg.cortex.Endpoint;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.transport.MulticastProtocol.Messages;
 import org.ogreg.cortex.transport.MulticastProtocol.Messages.Discover;
 import org.ogreg.cortex.transport.MulticastProtocol.Messages.ServiceLoc;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.protobuf.ByteString;
 
 public class RemoteConnector implements Closeable {
 	static final Logger log = LoggerFactory.getLogger(RemoteConnector.class);

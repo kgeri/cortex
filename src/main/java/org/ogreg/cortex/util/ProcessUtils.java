@@ -4,6 +4,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.channels.Selector;
 
 /**
  * Common helper methods for multi-threaded processing.
@@ -41,11 +42,13 @@ public class ProcessUtils {
 	 */
 	public static final void closeQuietly(Closeable closeable) {
 		try {
-			closeable.close();
+			if (closeable != null) {
+				closeable.close();
+			}
 		} catch (IOException e) {
 		}
 	}
-	
+
 	/**
 	 * Closes the <code>socket</code> ignoring any IO errors.
 	 * 
@@ -53,11 +56,13 @@ public class ProcessUtils {
 	 */
 	public static final void closeQuietly(Socket socket) {
 		try {
-			socket.close();
+			if (socket != null) {
+				socket.close();
+			}
 		} catch (IOException e) {
 		}
 	}
-	
+
 	/**
 	 * Closes the <code>socket</code> ignoring any IO errors.
 	 * 
@@ -65,7 +70,23 @@ public class ProcessUtils {
 	 */
 	public static final void closeQuietly(ServerSocket socket) {
 		try {
-			socket.close();
+			if (socket != null) {
+				socket.close();
+			}
+		} catch (IOException e) {
+		}
+	}
+
+	/**
+	 * Closes the <code>socket</code> ignoring any IO errors.
+	 * 
+	 * @param closeable
+	 */
+	public static final void closeQuietly(Selector selector) {
+		try {
+			if (selector != null) {
+				selector.close();
+			}
 		} catch (IOException e) {
 		}
 	}

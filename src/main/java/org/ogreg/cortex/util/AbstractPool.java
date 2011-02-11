@@ -1,7 +1,8 @@
 package org.ogreg.cortex.util;
 
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A generic base class for pooling objects of type T.
@@ -14,10 +15,11 @@ public abstract class AbstractPool<T> {
 	private final Object[] pool;
 
 	/** Synchronization object for limiting concurrent access to the pool. */
-	private final Semaphore sem;
+	private final Lock lock;
+	private final Condition notEmpty;
 
 	/** Stores the position of the next free element in the pool. */
-	private final AtomicInteger pos;
+	private int pos;
 
 	/**
 	 * Creates a pool with the given capacity, and initializes its elements using the
@@ -27,46 +29,48 @@ public abstract class AbstractPool<T> {
 	 */
 	public AbstractPool(int capacity) {
 		this.pool = new Object[capacity];
-		this.sem = new Semaphore(capacity);
-		this.pos = new AtomicInteger(0);
+		this.lock = new ReentrantLock();
+		this.notEmpty = lock.newCondition();
+		this.pos = capacity;
 	}
 
 	/**
-	 * Implementors should create one element of the pool here.
+	 * The implementation should create one element of the pool here.
 	 * 
 	 * @return
 	 */
-	public abstract T create();
+	protected abstract T create();
 
 	/**
-	 * Called before a free pooled element is returned with the {@link #get()} method.
+	 * The implementation should reset the element's state in this method, before it is returned to
+	 * the pool.
 	 */
-	protected void onElementGet(T element) {
-		// Default implementation does nothing
-	}
-
-	/**
-	 * Called before an used element is returned to the pool with the {@link #release(Object)}
-	 * method.
-	 */
-	protected void onElementReleased(T element) {
-		// Default implementation does nothing
-	}
+	protected abstract void clear(T element);
 
 	/**
 	 * Gets an element from the pool, blocking execution until at least one element becomes
 	 * available.
+	 * <p>
+	 * Warning: do not forget to call {@link #release(Object)} in a finally statement!
+	 * </p>
 	 * 
 	 * @return
 	 * @throws InterruptedException
+	 * @see {@link #release(Object)}
 	 */
 	@SuppressWarnings("unchecked")
-	public T get() throws InterruptedException {
-		sem.acquire();
-		T element = (T) pool[pos.getAndIncrement()];
-		element = element == null ? create() : element;
-		onElementGet(element);
-		return element;
+	public T acquire() throws InterruptedException {
+		lock.lockInterruptibly();
+		try {
+			while (pos == 0) {
+				notEmpty.await();
+			}
+			pos--;
+			T element = (T) pool[pos];
+			return element == null ? create() : element;
+		} finally {
+			lock.unlock();
+		}
 	}
 
 	/**
@@ -75,8 +79,14 @@ public abstract class AbstractPool<T> {
 	 * @param element
 	 */
 	public void release(T element) {
-		onElementReleased(element);
-		pool[pos.decrementAndGet()] = element;
-		sem.release();
+		lock.lock();
+		try {
+			clear(element);
+			pool[pos] = element;
+			pos++;
+			notEmpty.signal();
+		} finally {
+			lock.unlock();
+		}
 	}
 }

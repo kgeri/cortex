@@ -38,13 +38,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A connection manager for opening, closing and pooling standard (blocking) socket connections
- * towards other members of the cortex, and binding this node's server socket.
+ * A connection manager for opening, closing and pooling standard (blocking)
+ * socket connections towards other members of the cortex, and binding this
+ * node's server socket.
  * 
  * @author Gergely Kiss
  */
 public class DatagramTransportImpl implements Transport {
-	static final Logger log = LoggerFactory.getLogger(DatagramTransportImpl.class);
+	static final Logger log = LoggerFactory
+			.getLogger(DatagramTransportImpl.class);
 
 	/** The start of the usable port range (inclusive). */
 	private int minPort = 4000;
@@ -69,13 +71,10 @@ public class DatagramTransportImpl implements Transport {
 	/** Parallel executor service for processing incoming requests. */
 	ExecutorService executor;
 
-	volatile RequestListener listener;
-	ResponseWriter writer;
-
 	private DatagramChannelBuilder channelBuilder;
-	private SelectionKey channelKey;
-	private Selector selector;
-	DatagramChannel channel;
+
+	volatile DatagramChannel channel;
+	TransportServer server;
 
 	/**
 	 * Initializes the connector. Must be called prior to {@link #open()}.
@@ -86,38 +85,33 @@ public class DatagramTransportImpl implements Transport {
 		int corePoolSize = 1;
 		int maxPoolSize = 10;
 
-		executor = new ThreadPoolExecutor(corePoolSize, maxPoolSize, 1, TimeUnit.MINUTES,
-				new LinkedBlockingQueue<Runnable>());
+		executor = new ThreadPoolExecutor(corePoolSize, maxPoolSize, 1,
+				TimeUnit.MINUTES, new LinkedBlockingQueue<Runnable>());
 	}
 
 	@Override
 	public void open(long timeOut) throws InterruptedException, IOException {
-		if (listener != null && listener.isAlive()) {
+		if (server != null && server.isAlive()) {
 			return;
 		}
-		listener = new RequestListener();
+		server = new TransportServer();
 
-		synchronized (listener) {
+		synchronized (server) {
 			long until = System.currentTimeMillis() + timeOut;
-			channelBuilder = new DatagramChannelBuilder().minPort(minPort).maxPort(maxPort)
-					.bufferSize(socketBufferSize).soTimeOut(soTimeOut).log(log);
-
-			if (selector != null) {
-				selector.close();
-			}
-			selector = Selector.open();
+			channelBuilder = new DatagramChannelBuilder().minPort(minPort)
+					.maxPort(maxPort).bufferSize(socketBufferSize)
+					.soTimeOut(soTimeOut).log(log);
 
 			try {
-				listener.start();
-				listener.wait(ProcessUtils.check(until, "RequestListener open timed out"));
-				ProcessUtils.check(until, "RequestListener open timed out");
+				server.start();
+				server.wait(ProcessUtils.check(until,
+						"TransportServer open timed out"));
+				ProcessUtils.check(until, "TransportServer open timed out");
+				ensureTransportOpen();
 			} catch (InterruptedException e) {
 				ProcessUtils.closeQuietly(this);
 				throw e;
 			}
-
-			writer = new ResponseWriter();
-			writer.start();
 		}
 	}
 
@@ -126,25 +120,27 @@ public class DatagramTransportImpl implements Transport {
 			if (channel.isOpen()) {
 				return channel;
 			}
-			System.err.println("REOPENED");
-		} else {
-			System.err.println("OPENED");
 		}
 
 		synchronized (this) {
 			closeChannel();
 
 			channel = channelBuilder.bind();
-			channelKey = channel.register(selector, SelectionKey.OP_READ);
+			ensureTransportOpen().selector.wakeup();
 
 			return channel;
 		}
 	}
 
-	private synchronized void closeChannel() {
-		if (channelKey != null) {
-			channelKey.cancel();
+	private TransportServer ensureTransportOpen() throws TransportException {
+		if (server == null || !server.isAlive()) {
+			throw new TransportException(
+					"Failed to open channel, transport is not open");
 		}
+		return server;
+	}
+
+	private void closeChannel() {
 		ProcessUtils.closeQuietly(channel);
 	}
 
@@ -153,14 +149,12 @@ public class DatagramTransportImpl implements Transport {
 	 */
 	@Override
 	public synchronized void close() throws IOException {
-		closeChannel();
+		if (server != null) {
+			server.interrupt();
+			server = null;
+		}
 
-		if (listener != null) {
-			listener.interrupt();
-		}
-		if (writer != null) {
-			writer.interrupt();
-		}
+		closeChannel();
 
 		for (MessageCallback<?> callback : callbacks.values()) {
 			try {
@@ -172,13 +166,14 @@ public class DatagramTransportImpl implements Transport {
 		callbacks.clear();
 
 		for (TransportMessage message : output) {
-			synchronized (message) {
-				message.message.notifyAll();
+			if (message.message != null) {
+				synchronized (message.message) {
+					message.message.notifyAll();
+				}
 			}
 		}
 		output.clear();
 
-		listener = null;
 		log.info("Socket transport closed");
 	}
 
@@ -186,34 +181,39 @@ public class DatagramTransportImpl implements Transport {
 	public Object callSync(SocketAddress address, Message message, long timeOut)
 			throws InterruptedException, RemoteException {
 		long until = System.currentTimeMillis() + timeOut;
-		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(message);
+		SyncMessageCallback<Object> callback = new SyncMessageCallback<Object>(
+				message);
 		send(address, message, callback);
 		return callback.waitUntil(until);
 	}
 
 	@Override
-	public <R> void callAsync(SocketAddress address, Message message, MessageCallback<R> callback)
-			throws InterruptedException {
+	public <R> void callAsync(SocketAddress address, Message message,
+			MessageCallback<R> callback) throws InterruptedException {
 		send(address, message, callback);
 	}
 
 	@Override
-	public void callAsync(SocketAddress address, Message message) throws InterruptedException {
+	public void callAsync(SocketAddress address, Message message)
+			throws InterruptedException {
 		send(address, message, null);
 	}
 
-	private <R> void send(SocketAddress address, Message message, MessageCallback<R> callback) {
+	private <R> void send(SocketAddress address, Message message,
+			MessageCallback<R> callback) {
 		if (callback != null) {
 			callbacks.put(message.messageId, callback);
 		}
 		output.offer(new TransportMessage(address, message));
+		ensureTransportOpen().selector.wakeup();
 	}
 
 	protected void finalize() throws Throwable {
 		close();
 	}
 
-	private void processRequest(final SocketAddress source, final Message message) {
+	private void processRequest(final SocketAddress source,
+			final Message message) {
 		executor.submit(new Runnable() {
 			@Override
 			public void run() {
@@ -233,7 +233,8 @@ public class DatagramTransportImpl implements Transport {
 			Invocation m = (Invocation) message;
 
 			try {
-				Object service = registry.getService(m.getType(), m.getIdentifier());
+				Object service = registry.getService(m.getType(),
+						m.getIdentifier());
 				return new Response(message.messageId, m.invoke(service));
 			} catch (InvocationTargetException e) {
 				return new ErrorResponse(message.messageId, e.getCause());
@@ -241,13 +242,15 @@ public class DatagramTransportImpl implements Transport {
 				return new ErrorResponse(message.messageId, e);
 			}
 		} else {
-			return new ErrorResponse(message.messageId, new UnsupportedOperationException(
-					"Unsupported message: " + message));
+			return new ErrorResponse(message.messageId,
+					new UnsupportedOperationException("Unsupported message: "
+							+ message));
 		}
 	}
 
 	@SuppressWarnings({ "rawtypes", "unchecked" })
-	private void process(SocketAddress address, Message message) throws IOException {
+	private void process(SocketAddress address, Message message)
+			throws IOException {
 		// If it is a response, then we notify the listeners and remove it
 		if (message instanceof Response) {
 			Response response = (Response) message;
@@ -277,7 +280,8 @@ public class DatagramTransportImpl implements Transport {
 	}
 
 	/**
-	 * Returns the address on which the connector is listening, or null if it is not.
+	 * Returns the address on which the connector is listening, or null if it is
+	 * not.
 	 * 
 	 * @return
 	 */
@@ -317,25 +321,27 @@ public class DatagramTransportImpl implements Transport {
 	}
 
 	// Server listener thread
-	final class RequestListener extends Thread {
+	final class TransportServer extends Thread {
+		private Selector selector;
+		private SelectionKey channelKey;
 		private ByteBuffer inputBuffer;
+		private ByteBuffer outputBuffer;
 
-		public RequestListener() {
+		public TransportServer() {
 			this.inputBuffer = ByteBuffer.allocateDirect(socketBufferSize);
+			this.outputBuffer = ByteBuffer.allocateDirect(socketBufferSize);
 
-			setName("RequestListener");
+			setName("TransportServer");
 			setDaemon(true);
 		}
 
 		@Override
 		public void run() {
 			try {
+				selector = Selector.open();
 
 				while (!isInterrupted()) {
-					// Exceptions at this point are fatal
-					DatagramChannel channel = ensureChannel();
-					setName(channel.socket().getLocalPort() + "-RequestListener");
-
+					ensureChannel();
 					log.debug("{} started", getName());
 
 					synchronized (this) {
@@ -344,29 +350,50 @@ public class DatagramTransportImpl implements Transport {
 
 					try {
 						while (true) {
+							ensureChannel();
+
+							// Registering channel if needed
+							if (!channel.isRegistered()) {
+								// Cancelling previous channel registration
+								if (channelKey != null) {
+									channelKey.cancel();
+								}
+								channelKey = channel.register(selector,
+										SelectionKey.OP_READ);
+								setName(channel.socket().getLocalPort()
+										+ "-TransportServer");
+							}
+
+							// Listening for incoming data
 							listen(selector);
+
+							// Writing outgoing data
+							send();
 						}
 					} catch (SocketException e) {
 						log.info("{}", e.getLocalizedMessage());
 					} catch (IOException e) {
-						log.error("RequestListener IO error ({})", e.getLocalizedMessage());
+						log.error("TransportServer IO error ({})",
+								e.getLocalizedMessage());
 						log.debug("Failure trace", e);
 					} finally {
 						closeChannel();
 					}
-					log.debug("Reopening RequestListener in 100ms");
+					log.debug("Reopening TransportServer in 100ms");
 					sleep(100);
 				}
 			} catch (InterruptedException e) {
-				log.debug("RequestListener was interrupted, closing");
+				log.debug("TransportServer was interrupted, closing");
 			} catch (Throwable e) {
-				log.error("RequestListener FAILED", e);
+				log.error("TransportServer FAILED", e);
+			} finally {
 				closeChannel();
+				ProcessUtils.closeQuietly(selector);
 			}
 		}
 
 		private void listen(Selector selector) throws IOException {
-			selector.select(500); // TODO timeout
+			selector.select(100); // TODO need timeout to detect channel errors
 
 			Iterator<SelectionKey> it = selector.selectedKeys().iterator();
 
@@ -384,12 +411,10 @@ public class DatagramTransportImpl implements Transport {
 						int len = inputBuffer.getInt();
 						inputBuffer.limit(len);
 
-						ObjectInputStream ois = new ObjectInputStream(new ByteBufferInputStream(
-								inputBuffer));
+						ObjectInputStream ois = new ObjectInputStream(
+								new ByteBufferInputStream(inputBuffer));
 						Message message = (Message) ois.readObject();
 						process(address, message);
-
-						System.err.println("RECV: " + message + " from: " + address);
 					} catch (ClassNotFoundException e) {
 						log.error(e.getLocalizedMessage());
 					} catch (ClassCastException e) {
@@ -400,55 +425,35 @@ public class DatagramTransportImpl implements Transport {
 				}
 			}
 		}
-	}
 
-	final class ResponseWriter extends Thread {
-		private ByteBuffer outputBuffer;
+		private void send() throws IOException {
+			TransportMessage message = output.poll();
 
-		public ResponseWriter() {
-			setName("ResponseWriter");
-			setDaemon(true);
+			if (message == null) {
+				return;
+			}
 
-			this.outputBuffer = ByteBuffer.allocateDirect(socketBufferSize);
-		}
-
-		@Override
-		public void run() {
 			try {
-				setName(getBoundAddress().getPort() + "-ResponseWriter");
-				log.debug("{} started", getName());
+				// Serializing message to buffer
+				outputBuffer.clear();
+				outputBuffer.position(4); // Reserving some space for
+											// the size
+				ObjectOutputStream oos = new ObjectOutputStream(
+						new ByteBufferOutputStream(outputBuffer));
+				oos.writeObject(message.message);
+				oos.flush();
+				outputBuffer.flip();
+				int len = outputBuffer.limit();
+				outputBuffer.putInt(0, len); // Writing size field
 
-				while (!isInterrupted()) {
-					TransportMessage message = output.take();
-
-					try {
-						// Serializing message to buffer
-						outputBuffer.clear();
-						outputBuffer.position(4); // Reserving some space for the size
-						ObjectOutputStream oos = new ObjectOutputStream(new ByteBufferOutputStream(
-								outputBuffer));
-						oos.writeObject(message.message);
-						oos.flush();
-						outputBuffer.flip();
-						int len = outputBuffer.limit();
-						outputBuffer.putInt(0, len); // Writing size field
-
-						// Trying to write to the channel
-						// TODO datagram size tests
-						ensureChannel().send(outputBuffer, message.address);
-						System.err.println("SENT: " + message.message + " to: " + message.address);
-					} catch (IOException e) {
-						log.error("Failed to write message", e);
-						outputBuffer.clear();
-						output.offer(message);
-						log.debug("Reopening RequestWriter in 100ms");
-						sleep(100);
-					}
-				}
-			} catch (InterruptedException e) {
-				log.debug("ResponseWriter was interrupted");
-			} catch (Throwable e) {
-				log.error("ResponseWriter FAILED", e);
+				// Trying to write to the channel
+				// TODO datagram size tests
+				ensureChannel().send(outputBuffer, message.address);
+			} catch (IOException e) {
+				log.error("Failed to write message", e);
+				outputBuffer.clear();
+				output.offer(message);
+				throw e;
 			}
 		}
 	}
@@ -488,14 +493,15 @@ public class DatagramTransportImpl implements Transport {
 			}
 		}
 
-		public R waitUntil(long until) throws RemoteException, InterruptedException {
+		public R waitUntil(long until) throws RemoteException,
+				InterruptedException {
 			synchronized (request) {
 				while (!finished) {
 					try {
 						ensureChannel();
-						System.err.println("Channel OK");
 					} catch (IOException e) {
-						throw new InterruptedException("Read failed: " + e.getLocalizedMessage());
+						throw new InterruptedException("Read failed: "
+								+ e.getLocalizedMessage());
 					}
 					ProcessUtils.check(until, "Read timed out");
 					request.wait(100);

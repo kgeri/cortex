@@ -18,7 +18,7 @@ import org.ogreg.cortex.message.Message;
 import org.ogreg.cortex.message.MessageCallback;
 import org.ogreg.cortex.registry.ServiceRegistry;
 import org.ogreg.cortex.registry.ServiceRegistryImpl;
-import org.ogreg.cortex.transportv2.DatagramTransportImpl.RequestListener;
+import org.ogreg.cortex.transportv2.DatagramTransportImpl.TransportServer;
 import org.ogreg.cortex.util.ProcessUtils;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -41,7 +41,8 @@ public class DatagramTransportImplTest {
 	@Test(timeOut = 1000)
 	public void testInvokeMessage() throws Throwable {
 		registry.register(new TestService(), null);
-		registry.register(new TestService(new OutOfMemoryError("ONLY A TEST")), "bogus");
+		registry.register(new TestService(new OutOfMemoryError("ONLY A TEST")),
+				"bogus");
 
 		DatagramTransportImpl conn1 = open();
 		DatagramTransportImpl conn2 = open();
@@ -51,11 +52,13 @@ public class DatagramTransportImplTest {
 		Object r;
 
 		// First request OK
-		r = conn1.callSync(address, invoke(TestService.class, "add", "123", "456"), 10000);
+		r = conn1.callSync(address,
+				invoke(TestService.class, "add", "123", "456"), 10000);
 		assertEquals(r, "123456");
 
 		// Similar second request OK
-		r = conn1.callSync(address, invoke(TestService.class, "add", "abc", "def"), 10000);
+		r = conn1.callSync(address,
+				invoke(TestService.class, "add", "abc", "def"), 10000);
 		assertEquals(r, "abcdef");
 
 		// void request OK
@@ -74,10 +77,12 @@ public class DatagramTransportImplTest {
 
 		// Invoking an identified, bogus service
 		try {
-			r = conn1.callSync(address, invoke("bogus", TestService.class, "noop"), 10000);
+			r = conn1.callSync(address,
+					invoke("bogus", TestService.class, "noop"), 10000);
 			fail("Expected RemoteException");
 		} catch (RemoteException e) {
-			assertTrue(e.getCause() instanceof OutOfMemoryError, "Expected OutOfMemoryError cause");
+			assertTrue(e.getCause() instanceof OutOfMemoryError,
+					"Expected OutOfMemoryError cause");
 		}
 	}
 
@@ -85,19 +90,21 @@ public class DatagramTransportImplTest {
 	 * Tests connection opening errors.
 	 */
 	@Test(timeOut = 1000)
-	public void testConnectionErrors() throws Throwable {
+	public void testOpenErrors() throws Throwable {
 
 		// Bind failed, all ports are in use
-		DatagramTransportImpl conn1 = create();
-		conn1.setMinPort(4000);
-		conn1.setMaxPort(4000);
-		conn1.open(1000);
+		DatagramTransportImpl conn1 = open();
 		DatagramTransportImpl conn2 = create();
-		conn2.setMinPort(4000);
-		conn2.setMaxPort(4000);
-
-		conn2.open(1000);
-		assertFalse(conn2.listener.isAlive());
+		
+		try {
+			conn2.setMinPort(conn1.getBoundAddress().getPort());
+			conn2.setMaxPort(conn1.getBoundAddress().getPort());
+			conn2.open(10000);
+			fail("Expected TransportException");
+		} catch (TransportException e) {
+		}
+		
+		assertFalse(conn2.server.isAlive());
 
 		// Other IO error occurred
 		// This is hard to simulate
@@ -109,7 +116,8 @@ public class DatagramTransportImplTest {
 	@Test(timeOut = 1000)
 	public void testAsyncMessage() throws Exception {
 		registry.register(new TestService(), null);
-		registry.register(new TestService(new IllegalArgumentException()), "svc2");
+		registry.register(new TestService(new IllegalArgumentException()),
+				"svc2");
 
 		DatagramTransportImpl conn1 = open();
 		DatagramTransportImpl conn2 = open();
@@ -143,7 +151,7 @@ public class DatagramTransportImplTest {
 	/**
 	 * Tests connection closing and opening, double closing and opening.
 	 */
-	@Test(timeOut = 10000)
+	@Test(timeOut = 1000)
 	public void testOpenClose() throws Throwable {
 		registry.register(new TestService(), null);
 
@@ -155,7 +163,8 @@ public class DatagramTransportImplTest {
 		Object r;
 
 		// First request OK
-		r = conn1.callSync(address, invoke(TestService.class, "add", "123", "456"), 10000);
+		r = conn1.callSync(address,
+				invoke(TestService.class, "add", "123", "456"), 10000);
 		assertEquals(r, "123456");
 
 		// Closing and reopening
@@ -169,14 +178,15 @@ public class DatagramTransportImplTest {
 		address = conn2.getBoundAddress();
 
 		// Second request OK
-		r = conn1.callSync(address, invoke(TestService.class, "add", "abc", "def"), 10000);
+		r = conn1.callSync(address,
+				invoke(TestService.class, "add", "abc", "def"), 10000);
 		assertEquals(r, "abcdef");
 
 		// Closing by finalizer
-		RequestListener tmp = conn1.listener;
+		TransportServer tmp = conn1.server;
 		conn1.finalize();
 		Thread.sleep(100);
-		assertTrue(tmp.isAlive());
+		assertFalse(tmp.isAlive());
 	}
 
 	/**
@@ -190,28 +200,53 @@ public class DatagramTransportImplTest {
 		DatagramTransportImpl conn2 = open();
 
 		SocketAddress address = conn2.getBoundAddress();
-		Object r;
 
-//		// Method invoke timeout should result in an InterruptedException on the client side
-//		try {
-//			conn1.callSync(address, invoke(TestService.class, "noop"), 50);
-//			fail("Expected InterruptedException");
-//		} catch (InterruptedException e) {
-//		}
-
-		// Connections should be reopened on next invoke if the local host closed them
-		networkFailure(conn1);
-		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"), 10000);
-		assertEquals(r, "12");
-
-		// Connections should be reopened on next invoke if the remote host closed them
-		networkFailure(conn2);
-		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"), 1000);
-		assertEquals(r, "12");
+		// Method invoke timeout should result in an InterruptedException on the
+		// client side
+		try {
+			conn1.callSync(address, invoke(TestService.class, "noop"), 50);
+			fail("Expected InterruptedException");
+		} catch (InterruptedException e) {
+		}
 	}
-
+	
 	/**
-	 * Tests a request timeout.
+	 * Tests connection failure recovery.
+	 */
+	@Test(timeOut = 1000)
+	public void testConnectionRecovery() throws Throwable {
+		registry.register(new TestService(100), null);
+
+		DatagramTransportImpl conn1 = open();
+		DatagramTransportImpl conn2 = open();
+
+		SocketAddress address = conn2.getBoundAddress();
+		Object r;
+		
+		// Connections should be reopened on next invoke if the local host
+		// closed them
+		networkFailure(conn1, 0);
+		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"),
+				500);
+		assertEquals(r, "12");
+
+		// Connections should be reopened on next invoke if the remote host
+		// closed them
+		networkFailure(conn2, 200);
+		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"),
+				500);
+		assertEquals(r, "12");
+
+		// TODO Connections should be retried on next invoke if the remote host does
+		// not answer
+//		networkFailure(conn2, 0);
+//		r = conn1.callSync(address, invoke(TestService.class, "add", "1", "2"),
+//				500);
+//		assertEquals(r, "12");
+	}
+	
+	/**
+	 * Tests errors.
 	 */
 	@Test(timeOut = 1000)
 	public void testErrors() throws Throwable {
@@ -244,6 +279,7 @@ public class DatagramTransportImplTest {
 		System.out.println("TEARDOWN");
 		for (Closeable conn : testConnections) {
 			try {
+				System.out.println("Closing: " + conn);
 				conn.close();
 			} catch (IOException e) {
 			}
@@ -266,33 +302,33 @@ public class DatagramTransportImplTest {
 		return conn;
 	}
 
-	Invocation invoke(Class<?> type, String methodName, Object... args) throws Exception {
-		Class<?>[] types = new Class<?>[args.length];
-		for (int i = 0; i < args.length; i++) {
-			types[i] = args[i].getClass();
-		}
-
-		return Invocation.create(type.getDeclaredMethod(methodName, types), args);
-	}
-
-	Invocation invoke(String identifier, Class<?> type, String methodName, Object... args)
+	Invocation invoke(Class<?> type, String methodName, Object... args)
 			throws Exception {
 		Class<?>[] types = new Class<?>[args.length];
 		for (int i = 0; i < args.length; i++) {
 			types[i] = args[i].getClass();
 		}
 
-		return Invocation.create(identifier, type.getDeclaredMethod(methodName, types), args);
+		return Invocation.create(type.getDeclaredMethod(methodName, types),
+				args);
 	}
 
-	void networkFailure(DatagramTransportImpl transport) throws InterruptedException {
+	Invocation invoke(String identifier, Class<?> type, String methodName,
+			Object... args) throws Exception {
+		Class<?>[] types = new Class<?>[args.length];
+		for (int i = 0; i < args.length; i++) {
+			types[i] = args[i].getClass();
+		}
+
+		return Invocation.create(identifier,
+				type.getDeclaredMethod(methodName, types), args);
+	}
+
+	void networkFailure(DatagramTransportImpl transport, int sleep)
+			throws InterruptedException {
 		ProcessUtils.closeQuietly(transport.channel);
-		// for (ClientChannelImpl channel : transport.channels.values()) {
-		// ProcessUtils.closeQuietly(channel);
-		// ProcessUtils.closeQuietly(channel);
-		// }
 		System.out.println("TEST NETWORK FAILURE: " + transport);
-		// Thread.sleep(1000);
+		Thread.sleep(sleep);
 	}
 }
 
